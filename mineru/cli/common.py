@@ -13,9 +13,10 @@ from mineru.utils.draw_bbox import draw_layout_bbox, draw_span_bbox, draw_line_s
 from mineru.utils.enum_class import MakeMode
 from mineru.utils.guess_suffix_or_lang import guess_suffix_by_bytes
 from mineru.utils.pdf_image_tools import images_bytes_to_pdf_bytes
-from mineru.backend.vlm.vlm_middle_json_mkcontent import union_make as vlm_union_make
-from mineru.backend.vlm.vlm_analyze import doc_analyze as vlm_doc_analyze
-from mineru.backend.vlm.vlm_analyze import aio_doc_analyze as aio_vlm_doc_analyze
+# VLM模块改为延迟导入，避免在打包时（已排除VLM）出错
+# from mineru.backend.vlm.vlm_middle_json_mkcontent import union_make as vlm_union_make
+# from mineru.backend.vlm.vlm_analyze import doc_analyze as vlm_doc_analyze
+# from mineru.backend.vlm.vlm_analyze import aio_doc_analyze as aio_vlm_doc_analyze
 from mineru.utils.pdf_page_id import get_end_page_id
 
 if os.getenv("MINERU_LMDEPLOY_DEVICE", "") == "maca":
@@ -130,7 +131,15 @@ def _process_output(
     image_dir = str(os.path.basename(local_image_dir))
 
     if f_dump_md:
-        make_func = pipeline_union_make if is_pipeline else vlm_union_make
+        if is_pipeline:
+            make_func = pipeline_union_make
+        else:
+            # 延迟导入VLM模块（仅在VLM后端时导入）
+            try:
+                from mineru.backend.vlm.vlm_middle_json_mkcontent import union_make as vlm_union_make
+                make_func = vlm_union_make
+            except ImportError:
+                raise ImportError("VLM backend is not available. Please install VLM dependencies or use pipeline backend.")
         md_content_str = make_func(pdf_info, f_make_md_mode, image_dir)
         md_writer.write_string(
             f"{pdf_file_name}.md",
@@ -138,7 +147,15 @@ def _process_output(
         )
 
     if f_dump_content_list:
-        make_func = pipeline_union_make if is_pipeline else vlm_union_make
+        if is_pipeline:
+            make_func = pipeline_union_make
+        else:
+            # 延迟导入VLM模块（仅在VLM后端时导入）
+            try:
+                from mineru.backend.vlm.vlm_middle_json_mkcontent import union_make as vlm_union_make
+                make_func = vlm_union_make
+            except ImportError:
+                raise ImportError("VLM backend is not available. Please install VLM dependencies or use pipeline backend.")
         content_list = make_func(pdf_info, MakeMode.CONTENT_LIST, image_dir)
         md_writer.write_string(
             f"{pdf_file_name}_content_list.json",
@@ -242,6 +259,12 @@ async def _async_process_vlm(
         local_image_dir, local_md_dir = prepare_env(output_dir, pdf_file_name, parse_method)
         image_writer, md_writer = FileBasedDataWriter(local_image_dir), FileBasedDataWriter(local_md_dir)
 
+        # 延迟导入VLM模块（仅在VLM后端时导入）
+        try:
+            from mineru.backend.vlm.vlm_analyze import aio_doc_analyze as aio_vlm_doc_analyze
+        except ImportError:
+            raise ImportError("VLM backend is not available. Please install VLM dependencies or use pipeline backend.")
+        
         middle_json, infer_result = await aio_vlm_doc_analyze(
             pdf_bytes, image_writer=image_writer, backend=backend, server_url=server_url, **kwargs,
         )
@@ -283,6 +306,12 @@ def _process_vlm(
         local_image_dir, local_md_dir = prepare_env(output_dir, pdf_file_name, parse_method)
         image_writer, md_writer = FileBasedDataWriter(local_image_dir), FileBasedDataWriter(local_md_dir)
 
+        # 延迟导入VLM模块（仅在VLM后端时导入）
+        try:
+            from mineru.backend.vlm.vlm_analyze import doc_analyze as vlm_doc_analyze
+        except ImportError:
+            raise ImportError("VLM backend is not available. Please install VLM dependencies or use pipeline backend.")
+        
         middle_json, infer_result = vlm_doc_analyze(
             pdf_bytes, image_writer=image_writer, backend=backend, server_url=server_url, **kwargs,
         )
@@ -330,20 +359,11 @@ def do_parse(
             f_dump_model_output, f_dump_orig_pdf, f_dump_content_list, f_make_md_mode
         )
     else:
-        if backend.startswith("vlm-"):
-            backend = backend[4:]
-
-        if backend == "vllm-async-engine":
-            raise Exception("vlm-vllm-async-engine backend is not supported in sync mode, please use vlm-vllm-engine backend")
-
-        os.environ['MINERU_VLM_FORMULA_ENABLE'] = str(formula_enable)
-        os.environ['MINERU_VLM_TABLE_ENABLE'] = str(table_enable)
-
-        _process_vlm(
-            output_dir, pdf_file_names, pdf_bytes_list, backend,
-            f_draw_layout_bbox, f_draw_span_bbox, f_dump_md, f_dump_middle_json,
-            f_dump_model_output, f_dump_orig_pdf, f_dump_content_list, f_make_md_mode,
-            server_url, **kwargs,
+        # 此版本仅支持Pipeline后端，不支持VLM后端
+        raise ValueError(
+            f"VLM backend '{backend}' is not supported in this version. "
+            "This version only supports 'pipeline' backend. "
+            "Please use backend='pipeline' instead."
         )
 
 
@@ -381,20 +401,11 @@ async def aio_do_parse(
             f_dump_model_output, f_dump_orig_pdf, f_dump_content_list, f_make_md_mode
         )
     else:
-        if backend.startswith("vlm-"):
-            backend = backend[4:]
-
-        if backend == "vllm-engine":
-            raise Exception("vlm-vllm-engine backend is not supported in async mode, please use vlm-vllm-async-engine backend")
-
-        os.environ['MINERU_VLM_FORMULA_ENABLE'] = str(formula_enable)
-        os.environ['MINERU_VLM_TABLE_ENABLE'] = str(table_enable)
-
-        await _async_process_vlm(
-            output_dir, pdf_file_names, pdf_bytes_list, backend,
-            f_draw_layout_bbox, f_draw_span_bbox, f_dump_md, f_dump_middle_json,
-            f_dump_model_output, f_dump_orig_pdf, f_dump_content_list, f_make_md_mode,
-            server_url, **kwargs,
+        # 此版本仅支持Pipeline后端，不支持VLM后端
+        raise ValueError(
+            f"VLM backend '{backend}' is not supported in this version. "
+            "This version only supports 'pipeline' backend. "
+            "Please use backend='pipeline' instead."
         )
 
 

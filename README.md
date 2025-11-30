@@ -1,4 +1,24 @@
 <div align="center" xmlns="http://www.w3.org/1999/html">
+
+## 📌 项目说明
+
+**本项目 Fork 自 [opendatalab/MinerU](https://github.com/opendatalab/MinerU)**
+
+本项目的主要目标是：
+- 🎨 **开发一个功能完备且美观的GUI界面**
+- 🚀 **实现一键启动，简化使用流程**
+- 📋 **支持任务队列功能，可批量处理多个PDF文件**
+- ⚡ **支持CPU模式运行，无需GPU也能使用**
+- 🌓 **自动跟随系统主题切换（浅色/暗色）**
+- 📊 **实时显示处理进度和每页处理时间统计**
+
+**GUI启动方式：**
+```bash
+python mineru_gui.py
+```
+
+---
+
 <!-- logo -->
 <p align="center">
   <img src="https://gcore.jsdelivr.net/gh/opendatalab/MinerU@master/docs/images/MinerU-logo.png" width="300px" style="vertical-align:middle;">

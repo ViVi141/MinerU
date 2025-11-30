@@ -1,9 +1,7 @@
 # Copyright (c) Opendatalab. All rights reserved.
 
-from loguru import logger
 from bs4 import BeautifulSoup
 
-from mineru.backend.vlm.vlm_middle_json_mkcontent import merge_para_with_text
 from mineru.utils.enum_class import BlockType, SplitFlag
 
 
@@ -174,6 +172,22 @@ def can_merge_tables(current_table_block, previous_table_block):
     # 如果有TABLE_CAPTION类型的块,检查是否至少有一个以"(续)"结尾
     caption_blocks = [block for block in current_table_block["blocks"] if block["type"] == BlockType.TABLE_CAPTION]
     if caption_blocks:
+        # 延迟导入merge_para_with_text（从pipeline后端导入，避免VLM依赖）
+        try:
+            from mineru.backend.pipeline.pipeline_middle_json_mkcontent import merge_para_with_text
+        except ImportError:
+            # 如果导入失败，使用简单的文本提取函数
+            def merge_para_with_text(block):
+                """简单的文本提取函数，用于提取块中的文本内容"""
+                text = ''
+                if 'lines' in block:
+                    for line in block['lines']:
+                        if 'spans' in line:
+                            for span in line['spans']:
+                                if 'content' in span:
+                                    text += span['content']
+                return text
+        
         # 如果所有caption都不以"(续)"结尾,则不合并
         if not any(full_to_half(merge_para_with_text(block).strip()).endswith("(续)") for block in caption_blocks):
             return False, None, None, None, None
