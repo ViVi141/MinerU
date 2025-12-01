@@ -6,6 +6,7 @@ MinerU PDF转Markdown GUI应用程序
 import os
 import sys
 import threading
+import time
 import tkinter.filedialog as filedialog
 from dataclasses import dataclass
 from datetime import datetime
@@ -327,35 +328,348 @@ class MinerUGUI(ctk.CTk):
     
     def __init__(self):
         super().__init__()
-        
+
         # 配置窗口
         self.title("MinerU - PDF转Markdown工具")
         self.geometry("1100x800")
         self.minsize(1000, 700)
-        
+
         # 转换状态
         self.is_converting = False
         self.conversion_thread: Optional[threading.Thread] = None
         self.queue_lock = threading.Lock()
-        
+
         # 任务队列
         self.task_queue: List[ConversionTask] = []
         self.current_task_index = -1
-        
+
         # 队列更新控制
         self.queue_update_pending = False
         self.queue_update_id = None
-        
+
         # 任务列表显示优化（虚拟滚动）
         self.max_visible_tasks = 50  # 最多同时显示50个任务
         self.task_display_start = 0  # 显示起始索引
         self.task_widgets_cache = {}  # 任务组件缓存
-        
+
+        # 资源管理
+        self._shutdown_event = threading.Event()
+        self._resource_lock = threading.Lock()
+        self._active_resources = set()  # 跟踪活跃资源
+
+        # GUI更新队列（线程安全）
+        self._gui_update_queue = []
+        self._gui_update_lock = threading.Lock()
+        self._gui_update_scheduled = False
+
+        # 内存监控
+        self._memory_check_interval = 30000  # 30秒检查一次内存
+        self._memory_warning_threshold = 1024 * 1024 * 1024  # 1GB警告阈值
+        self._last_memory_check = 0
+
+        # 队列管理（动态从UI获取）
+        self._auto_cleanup_interval = 60000  # 1分钟清理一次
+        self._last_cleanup_check = 0
+        self._cleanup_batch_size = 50  # 每次清理50个任务
+
         # 创建界面（必须先创建，因为setup_logging需要log_text）
         self.create_widgets()
-        
+
         # 配置日志输出到GUI（在create_widgets之后，确保log_text已初始化）
         self.setup_logging()
+
+        # 绑定窗口关闭事件
+        self.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+    def on_closing(self):
+        """窗口关闭时的清理工作"""
+        try:
+            self.log("正在关闭应用程序并清理资源...", switch_to_log=True)
+
+            # 设置关闭标志
+            self._shutdown_event.set()
+
+            # 取消当前转换
+            if self.is_converting:
+                self.log("正在取消当前任务...", switch_to_log=True)
+                self.is_converting = False
+
+            # 等待线程结束（带超时）
+            if self.conversion_thread and self.conversion_thread.is_alive():
+                self.log("等待后台任务完成...", switch_to_log=True)
+                self.conversion_thread.join(timeout=5.0)  # 最多等待5秒
+
+                if self.conversion_thread.is_alive():
+                    self.log("强制终止后台任务...", switch_to_log=True)
+
+            # 清理资源
+            self._cleanup_resources()
+
+            # 清理任务组件缓存
+            self._cleanup_task_widgets()
+
+            # 清理队列更新定时器
+            if self.queue_update_id:
+                try:
+                    self.after_cancel(self.queue_update_id)
+                    self.queue_update_id = None
+                except Exception:
+                    pass
+
+            # 停止GUI更新处理器
+            self._shutdown_event.set()
+
+            self.log("应用程序已安全关闭", switch_to_log=True)
+
+        except Exception as e:
+            logger.exception(f"关闭应用程序时发生错误: {e}")
+        finally:
+            # 确保窗口关闭
+            try:
+                self.quit()
+                self.destroy()
+            except Exception:
+                pass
+
+    def _cleanup_resources(self):
+        """清理资源"""
+        with self._resource_lock:
+            # 清理活跃资源
+            for resource in self._active_resources.copy():
+                try:
+                    if hasattr(resource, 'close'):
+                        resource.close()
+                    elif hasattr(resource, '__del__'):
+                        resource.__del__()
+                except Exception as e:
+                    logger.warning(f"清理资源时出错: {e}")
+                finally:
+                    self._active_resources.discard(resource)
+
+    def _update_queue_info_only(self):
+        """仅更新队列统计信息，不重新创建组件"""
+        try:
+            with self.queue_lock:
+                queue_size = len(self.task_queue)
+
+                if queue_size == 0:
+                    self.queue_info_var.set("队列为空")
+                    self.page_info_var.set("")
+                    self.prev_page_btn.configure(state="disabled")
+                    self.next_page_btn.configure(state="disabled")
+                else:
+                    pending = sum(1 for t in self.task_queue if t.status == TaskStatus.PENDING)
+                    processing = sum(1 for t in self.task_queue if t.status == TaskStatus.PROCESSING)
+                    completed = sum(1 for t in self.task_queue if t.status == TaskStatus.COMPLETED)
+                    failed = sum(1 for t in self.task_queue if t.status == TaskStatus.FAILED)
+
+                    self.queue_info_var.set(
+                        f"队列: {queue_size} 个任务 | "
+                        f"等待: {pending} | "
+                        f"处理中: {processing} | "
+                        f"完成: {completed} | "
+                        f"失败: {failed}"
+                    )
+
+                    # 更新分页信息
+                    if queue_size > self.max_visible_tasks:
+                        total_pages = (queue_size + self.max_visible_tasks - 1) // self.max_visible_tasks
+                        current_page = (self.task_display_start // self.max_visible_tasks) + 1
+                        display_end = min(self.task_display_start + self.max_visible_tasks, queue_size)
+                        self.page_info_var.set(f"显示 {self.task_display_start + 1}-{display_end} / {queue_size} (第 {current_page}/{total_pages} 页)")
+                        self.prev_page_btn.configure(state="normal" if self.task_display_start > 0 else "disabled")
+                        self.next_page_btn.configure(state="normal" if display_end < queue_size else "disabled")
+                    else:
+                        self.page_info_var.set("")
+                        self.prev_page_btn.configure(state="disabled")
+                        self.next_page_btn.configure(state="disabled")
+
+        except Exception as e:
+            logger.warning(f"更新队列信息时出错: {e}")
+
+    def _cleanup_task_widgets(self):
+        """清理任务组件缓存"""
+        try:
+            for widget in self.task_widgets_cache.values():
+                if widget and widget.winfo_exists():
+                    try:
+                        widget.destroy()
+                    except Exception:
+                        pass
+            self.task_widgets_cache.clear()
+        except Exception as e:
+            logger.warning(f"清理任务组件时出错: {e}")
+
+    def _check_memory_usage(self):
+        """检查内存使用情况"""
+        if self._shutdown_event.is_set():
+            return
+
+        # 检查是否启用内存监控
+        if hasattr(self, 'enable_memory_monitor_var') and not self.enable_memory_monitor_var.get():
+            return
+
+        try:
+            import psutil
+            import os
+
+            current_time = time.time() * 1000  # 转换为毫秒
+            if current_time - self._last_memory_check < self._memory_check_interval:
+                return
+
+            self._last_memory_check = current_time
+
+            # 获取当前进程内存使用
+            process = psutil.Process(os.getpid())
+            memory_mb = process.memory_info().rss / (1024 * 1024)
+
+            # 如果内存使用超过阈值，进行垃圾回收
+            if memory_mb > (self._memory_warning_threshold / (1024 * 1024)):
+                self.log(f"⚠️ 内存使用较高: {memory_mb:.1f} MB，进行垃圾回收...", switch_to_log=True)
+                import gc
+                gc.collect()
+
+                # 再次检查内存
+                memory_after_gc = process.memory_info().rss / (1024 * 1024)
+                self.log(f"   垃圾回收后内存: {memory_after_gc:.1f} MB", switch_to_log=True)
+
+                # 如果内存仍然很高，清理缓存
+                if memory_after_gc > (self._memory_warning_threshold / (1024 * 1024) * 0.8):
+                    self._cleanup_task_widgets()
+                    self.log("   已清理任务组件缓存", switch_to_log=True)
+
+        except ImportError:
+            # 如果没有psutil，跳过内存检查
+            pass
+        except Exception as e:
+            logger.warning(f"内存检查时出错: {e}")
+
+    def _auto_cleanup_completed_tasks(self):
+        """自动清理已完成的旧任务"""
+        if self._shutdown_event.is_set():
+            return
+
+        try:
+            current_time = time.time() * 1000  # 转换为毫秒
+            if current_time - self._last_cleanup_check < self._auto_cleanup_interval:
+                return
+
+            self._last_cleanup_check = current_time
+
+            with self.queue_lock:
+                # 获取已完成和失败的任务
+                completed_tasks = [t for t in self.task_queue if t.status in [TaskStatus.COMPLETED, TaskStatus.FAILED]]
+
+                # 使用UI设置的最大保留任务数
+                max_completed = self.keep_completed_var.get() if hasattr(self, 'keep_completed_var') else 500
+
+                if len(completed_tasks) > max_completed:
+                    # 需要清理的任务数量
+                    to_remove_count = len(completed_tasks) - self._max_completed_tasks
+
+                    # 按完成时间排序，保留最新的
+                    completed_tasks.sort(key=lambda t: t.end_time or datetime.min, reverse=True)
+
+                    # 获取需要删除的任务
+                    tasks_to_remove = completed_tasks[-to_remove_count:]
+
+                    # 从队列中移除这些任务
+                    original_length = len(self.task_queue)
+                    self.task_queue = [t for t in self.task_queue if t not in tasks_to_remove]
+
+                    removed_count = original_length - len(self.task_queue)
+
+                    if removed_count > 0:
+                        self.log(f"🧹 已自动清理 {removed_count} 个旧的已完成任务", switch_to_log=False)
+
+                        # 清理相关的组件缓存
+                        task_ids_to_remove = []
+                        for task in tasks_to_remove:
+                            # 找到任务在原始队列中的索引作为ID
+                            for i, t in enumerate(self.task_queue):
+                                if t == task:
+                                    task_ids_to_remove.append(i)
+                                    break
+
+                        for task_id in task_ids_to_remove:
+                            self.task_widgets_cache.pop(task_id, None)
+
+                        # 如果当前显示的页面受到影响，调整显示起始位置
+                        if self.task_display_start >= len(self.task_queue) and len(self.task_queue) > 0:
+                            self.task_display_start = max(0, len(self.task_queue) - self.max_visible_tasks)
+
+                        # 更新显示
+                        self._update_queue_info_only()
+
+        except Exception as e:
+            logger.warning(f"自动清理任务时出错: {e}")
+
+    def _force_gc_and_cleanup(self):
+        """强制垃圾回收和清理"""
+        try:
+            import gc
+            # 强制垃圾回收
+            gc.collect()
+
+            # 清理任务缓存
+            if len(self.task_widgets_cache) > self.max_visible_tasks:
+                # 只保留最近的任务组件
+                cache_items = list(self.task_widgets_cache.items())
+                # 保留最新的组件
+                to_remove = cache_items[:-self.max_visible_tasks]
+                for task_id, widget in to_remove:
+                    if widget and widget.winfo_exists():
+                        try:
+                            widget.destroy()
+                        except Exception:
+                            pass
+                    self.task_widgets_cache.pop(task_id, None)
+
+            self.log("已执行内存清理和垃圾回收", switch_to_log=True)
+        except Exception as e:
+            logger.warning(f"强制清理时出错: {e}")
+
+    def schedule_gui_update(self, callback, *args, **kwargs):
+        """线程安全的GUI更新调度"""
+        if self._shutdown_event.is_set():
+            return
+
+        with self._gui_update_lock:
+            self._gui_update_queue.append((callback, args, kwargs))
+
+            # 如果还没有调度更新，则调度一个
+            if not self._gui_update_scheduled:
+                self._gui_update_scheduled = True
+                self.after(50, self._process_gui_updates)  # 50ms后处理
+
+    def _process_gui_updates(self):
+        """处理GUI更新队列"""
+        if self._shutdown_event.is_set():
+            return
+
+        updates_to_process = []
+        with self._gui_update_lock:
+            updates_to_process = self._gui_update_queue.copy()
+            self._gui_update_queue.clear()
+            self._gui_update_scheduled = False
+
+        # 在主线程中执行更新
+        for callback, args, kwargs in updates_to_process:
+            try:
+                if callable(callback):
+                    callback(*args, **kwargs)
+            except Exception as e:
+                logger.warning(f"GUI更新时出错: {e}")
+
+        # 如果还有待处理的更新，继续调度
+        with self._gui_update_lock:
+            if self._gui_update_queue and not self._gui_update_scheduled:
+                self._gui_update_scheduled = True
+                self.after(50, self._process_gui_updates)
+
+        # 定期检查内存使用情况和队列清理
+        self._check_memory_usage()
+        self._auto_cleanup_completed_tasks()
     
     def setup_logging(self):
         """配置日志输出到GUI，遵循Python日志最佳实践"""
@@ -923,6 +1237,76 @@ class MinerUGUI(ctk.CTk):
             anchor="w"
         )
         cpu_hint.pack(anchor="w", pady=(5, 15))
+
+        # 性能设置
+        perf_group = ctk.CTkFrame(scroll_frame)
+        perf_group.pack(fill="x", pady=5)
+
+        ctk.CTkLabel(
+            perf_group,
+            text="⚡ 性能设置",
+            font=ctk.CTkFont(size=16, weight="bold")
+        ).pack(anchor="w", padx=15, pady=(15, 10))
+
+        perf_content = ctk.CTkFrame(perf_group, fg_color="transparent")
+        perf_content.pack(fill="x", padx=15, pady=(0, 10))
+
+        # 最大队列大小设置
+        queue_row = ctk.CTkFrame(perf_content, fg_color="transparent")
+        queue_row.pack(fill="x", pady=5)
+
+        ctk.CTkLabel(queue_row, text="最大队列大小:", width=120, anchor="w").pack(side="left", padx=5)
+        self.max_queue_size_var = ctk.IntVar(value=2000)
+        self.max_queue_entry = ctk.CTkEntry(
+            queue_row,
+            textvariable=self.max_queue_size_var,
+            placeholder_text="2000",
+            width=100
+        )
+        self.max_queue_entry.pack(side="left", padx=5)
+
+        ctk.CTkLabel(queue_row, text="(任务数量上限，建议500-5000)", anchor="w").pack(side="left", padx=5)
+
+        # 自动清理设置
+        cleanup_row = ctk.CTkFrame(perf_content, fg_color="transparent")
+        cleanup_row.pack(fill="x", pady=5)
+
+        ctk.CTkLabel(cleanup_row, text="保留已完成任务:", width=120, anchor="w").pack(side="left", padx=5)
+        self.keep_completed_var = ctk.IntVar(value=500)
+        self.keep_completed_entry = ctk.CTkEntry(
+            cleanup_row,
+            textvariable=self.keep_completed_var,
+            placeholder_text="500",
+            width=100
+        )
+        self.keep_completed_entry.pack(side="left", padx=5)
+
+        ctk.CTkLabel(cleanup_row, text="(自动清理旧任务，建议200-1000)", anchor="w").pack(side="left", padx=5)
+
+        # 内存监控设置
+        memory_row = ctk.CTkFrame(perf_content, fg_color="transparent")
+        memory_row.pack(fill="x", pady=5)
+
+        self.enable_memory_monitor_var = ctk.BooleanVar(value=True)
+        memory_monitor_check = ctk.CTkCheckBox(
+            memory_row,
+            text="启用内存监控",
+            variable=self.enable_memory_monitor_var
+        )
+        memory_monitor_check.pack(side="left", padx=5)
+
+        ctk.CTkLabel(memory_row, text="(自动检测和清理内存泄露)", anchor="w").pack(side="left", padx=5)
+
+        # 性能提示
+        perf_hint = ctk.CTkLabel(
+            perf_content,
+            text="💡 大量文件处理建议: 队列大小2000，保留任务500，启用内存监控\n"
+                 "   处理大量文件时会自动进行分页显示和内存清理，避免界面卡顿",
+            font=ctk.CTkFont(size=11),
+            text_color=("gray50", "gray50"),
+            anchor="w"
+        )
+        perf_hint.pack(anchor="w", pady=(10, 15))
         
         # 其他提示
         tips_group = ctk.CTkFrame(scroll_frame)
@@ -1150,23 +1534,61 @@ class MinerUGUI(ctk.CTk):
             self.log("❌ 错误: 没有有效的文件可以添加到队列", switch_to_log=True)
             return
         
-        # 添加到队列
+        # 添加到队列（分批处理，避免一次性创建过多组件）
+        added_count = 0
         with self.queue_lock:
-            for file_path in valid_files:
-                task = ConversionTask(
-                    file_path=file_path,
-                    file_name=file_path.stem
-                )
-                self.task_queue.append(task)
-        
-        # 添加到队列后，切换到任务队列Tab，并显示成功消息
-        self.update_queue_display()
-        self.tabview.set("📋 任务队列")
-        # 在队列Tab显示提示信息（不切换到日志）
-        if invalid_count > 0:
-            self.log(f"✅ 已添加 {len(valid_files)} 个文件到队列（已跳过 {invalid_count} 个无效文件）", switch_to_log=False)
+            batch_size = 100  # 每批最多添加100个文件
+
+            # 使用UI设置的最大队列大小
+            max_queue_size = self.max_queue_size_var.get() if hasattr(self, 'max_queue_size_var') else 2000
+
+            # 检查当前队列大小
+            current_queue_size = len(self.task_queue)
+            if current_queue_size >= max_queue_size:
+                self.log(f"⚠️ 队列已满（最多{max_queue_size}个任务），无法添加新文件", switch_to_log=False)
+                return
+
+            # 计算可以添加的最大文件数
+            available_slots = max_queue_size - current_queue_size
+            files_to_add = min(len(valid_files), available_slots)
+
+            if files_to_add < len(valid_files):
+                self.log(f"⚠️ 队列空间不足，只添加前{files_to_add}个文件", switch_to_log=False)
+
+            actual_files = valid_files[:files_to_add]
+
+            for i in range(0, len(actual_files), batch_size):
+                batch = actual_files[i:i + batch_size]
+                for file_path in batch:
+                    task = ConversionTask(
+                        file_path=file_path,
+                        file_name=file_path.stem
+                    )
+                    self.task_queue.append(task)
+                    added_count += 1
+
+                # 每批处理完后短暂暂停，避免阻塞UI
+                if i + batch_size < len(actual_files):
+                    self.after(10)  # 短暂让出控制权
+
+        # 只有在添加的文件数量较少时才立即更新显示
+        if len(valid_files) <= 50:
+            self.update_queue_display()
         else:
-            self.log(f"✅ 已添加 {len(valid_files)} 个文件到队列", switch_to_log=False)
+            # 对于大量文件，只更新队列信息，不重新创建组件
+            self._update_queue_info_only()
+
+        self.tabview.set("📋 任务队列")
+
+        # 显示成功消息
+        if invalid_count > 0:
+            self.log(f"✅ 已添加 {added_count} 个文件到队列（已跳过 {invalid_count} 个无效文件）", switch_to_log=False)
+        else:
+            self.log(f"✅ 已添加 {added_count} 个文件到队列", switch_to_log=False)
+
+        # 如果添加了大量文件，给出提示
+        if len(valid_files) > 200:
+            self.log("💡 已添加大量文件，为避免界面卡顿，仅显示部分任务。请使用分页查看。", switch_to_log=False)
     
     def clear_queue(self):
         """清空任务队列"""
@@ -1174,10 +1596,24 @@ class MinerUGUI(ctk.CTk):
             if self.is_converting:
                 self.log("⚠️ 警告: 正在处理中，无法清空队列", switch_to_log=False)
                 return
+
+            queue_size = len(self.task_queue)
+
+            # 分批清理，避免一次性操作过多任务
+            if queue_size > 100:
+                self.log(f"正在清理 {queue_size} 个任务...", switch_to_log=False)
+
             self.task_queue.clear()
             self.current_task_index = -1
             self.task_display_start = 0  # 重置分页
-        
+
+        # 清理相关的组件缓存
+        self._cleanup_task_widgets()
+
+        # 强制垃圾回收
+        import gc
+        gc.collect()
+
         self.log("✅ 队列已清空", switch_to_log=False)
         self.update_queue_display()
         # 保持在任务队列Tab
@@ -2167,59 +2603,94 @@ class MinerUGUI(ctk.CTk):
         
         # 输出当前选择配置
         self.log_selected_config()
-        
+
+        # 在开始处理前进行内存清理
+        self.log("🧹 正在准备处理环境...", switch_to_log=True)
+        self._force_gc_and_cleanup()
+
         # 检查并提示GPU加速状态
         self.check_and_log_gpu_status()
-        
+
         self.log("", switch_to_log=True)
         self.log("=" * 60, switch_to_log=True)
-        self.log("开始处理任务队列...", switch_to_log=True)
+        self.log(f"开始处理任务队列（{len(pending_tasks)} 个待处理任务）...", switch_to_log=True)
         self.log("=" * 60, switch_to_log=True)
         
         # 在新线程中执行队列处理
         self.conversion_thread = threading.Thread(
             target=self.process_queue,
-            daemon=True
+            daemon=True,
+            name="MinerU-Conversion-Thread"
         )
         self.conversion_thread.start()
     
     def process_queue(self):
         """处理任务队列"""
         try:
-            while True:
+            while not self._shutdown_event.is_set():
+                # 检查是否应该继续处理
+                if not self.is_converting:
+                    break
+
                 # 获取下一个待处理任务
                 with self.queue_lock:
                     pending_tasks = [t for t in self.task_queue if t.status == TaskStatus.PENDING]
                     if not pending_tasks:
                         break
-                    
+
                     task = pending_tasks[0]
                     task.status = TaskStatus.PROCESSING
                     task.start_time = datetime.now()
                     task_index = self.task_queue.index(task)
                     self.current_task_index = task_index
-                
-                # 更新显示（使用after确保在主线程中执行）
-                self.after(0, self.update_queue_display)
+
+                # 检查关闭事件
+                if self._shutdown_event.is_set():
+                    break
+
+                # 更新显示（使用线程安全的方法）
+                self.schedule_gui_update(self.update_queue_display)
+
+                # 每处理50个任务报告一次进度
+                if (task_index + 1) % 50 == 0:
+                    total_tasks = len(self.task_queue)
+                    self.log(f"\n📊 进度报告: 已开始处理 {task_index + 1}/{total_tasks} 个任务", switch_to_log=True)
+
                 self.log(f"\n开始处理任务 #{task_index + 1}: {task.file_name}", switch_to_log=True)
-                
+
                 # 处理任务
                 try:
                     # 获取PDF页数
+                    pdf_doc = None
                     try:
                         pdf_bytes = read_fn(task.file_path)
                         pdf_doc = pdfium.PdfDocument(pdf_bytes)
                         task.page_count = len(pdf_doc)
-                        pdf_doc.close()
                     except Exception:
                         task.page_count = 0
-                    
+                    finally:
+                        # 确保PDF文档被关闭
+                        if pdf_doc:
+                            try:
+                                pdf_doc.close()
+                            except Exception:
+                                pass
+
+                    # 检查关闭事件
+                    if self._shutdown_event.is_set():
+                        task.status = TaskStatus.CANCELLED
+                        break
+
                     # 记录开始时间
                     import time
                     start_time = time.time()
-                    
+
+                    # 处理前检查内存使用情况
+                    if (task_index + 1) % 100 == 0:  # 每100个任务检查一次
+                        self._check_memory_usage()
+
                     self.process_single_task(task)
-                    
+
                     # 计算处理时间
                     end_time = time.time()
                     task.total_time = end_time - start_time
@@ -2227,10 +2698,10 @@ class MinerUGUI(ctk.CTk):
                         task.time_per_page = task.total_time / task.page_count
                     else:
                         task.time_per_page = 0.0
-                    
+
                     task.status = TaskStatus.COMPLETED
                     task.end_time = datetime.now()
-                    
+
                     # 显示完成信息，包含时间统计
                     if task.page_count > 0:
                         time_info = f"（{task.page_count}页，总耗时: {task.total_time:.1f}秒，平均: {task.time_per_page:.2f}秒/页）"
@@ -2245,12 +2716,12 @@ class MinerUGUI(ctk.CTk):
                     self.log(f"   错误: {str(e)}", switch_to_log=True)
                     # 使用logger记录详细异常信息（会自动输出到GUI）
                     logger.exception(f"任务 #{task_index + 1} 处理失败: {task.file_name}")
-                
-                # 更新显示（使用after确保在主线程中执行）
-                self.after(0, self.update_queue_display)
-                
-                # 检查是否取消
-                if not self.is_converting:
+
+                # 更新显示（使用线程安全的方法）
+                self.schedule_gui_update(self.update_queue_display)
+
+                # 检查是否取消或关闭
+                if not self.is_converting or self._shutdown_event.is_set():
                     if task.status == TaskStatus.PROCESSING:
                         task.status = TaskStatus.CANCELLED
                     break
@@ -2286,8 +2757,12 @@ class MinerUGUI(ctk.CTk):
             if stats_info:
                 self.log(stats_info, switch_to_log=True)
             self.log("=" * 60, switch_to_log=True)
+
+            # 执行清理
+            self.schedule_gui_update(self._force_gc_and_cleanup)
+
             # 处理完成后，切换到任务队列Tab查看结果
-            self.after(500, lambda: self.tabview.set("📋 任务队列"))
+            self.schedule_gui_update(lambda: self.tabview.set("📋 任务队列"))
             
         except Exception as e:
             self.log(f"❌ 队列处理出错: {str(e)}", switch_to_log=True)
@@ -2307,7 +2782,7 @@ class MinerUGUI(ctk.CTk):
         # 获取配置参数
         output_dir = self.output_path_var.get()
         backend = self.backend_var.get()
-        
+
         # 从显示名称中提取实际的方法代码
         method_display = self.method_var.get()
         if 'auto' in method_display:
@@ -2318,69 +2793,89 @@ class MinerUGUI(ctk.CTk):
             method = 'ocr'
         else:
             method = method_display
-        
+
         # 从显示名称中提取实际的语言代码
         lang_display = self.lang_var.get()
         lang = lang_display.split()[0] if ' ' in lang_display else lang_display  # 提取代码部分
         formula_enable = self.formula_var.get()
         table_enable = self.table_var.get()
-        
+
         # 页码范围
         try:
             start_page_id = int(self.start_page_var.get()) if self.start_page_var.get() else 0
         except ValueError:
             start_page_id = 0
-        
+
         try:
             end_page_id = int(self.end_page_var.get()) if self.end_page_var.get() else None
         except ValueError:
             end_page_id = None
-        
+
         # 设备模式
         device_mode = self.device_var.get().strip() or None
         if device_mode:
             os.environ['MINERU_DEVICE_MODE'] = device_mode
-        
+
         # 输出实际运行模式（在设备模式设置后）
         self.log_actual_runtime_mode()
-        
-        # 读取文件
-        pdf_bytes = read_fn(task.file_path)
-        file_name = task.file_name
-        
-        # 更新进度
-        task.progress = 0.2
-        self.after(0, self.update_queue_display)
-        
-        # 执行转换
-        do_parse(
-            output_dir=output_dir,
-            pdf_file_names=[file_name],
-            pdf_bytes_list=[pdf_bytes],
-            p_lang_list=[lang],
-            backend=backend,
-            parse_method=method,
-            formula_enable=formula_enable,
-            table_enable=table_enable,
-            start_page_id=start_page_id,
-            end_page_id=end_page_id,
-        )
-        
-        # 完成
-        task.progress = 1.0
-        self.after(0, self.update_queue_display)
+
+        # 读取文件并确保资源管理
+        pdf_bytes = None
+        try:
+            pdf_bytes = read_fn(task.file_path)
+            file_name = task.file_name
+
+            # 检查关闭事件
+            if self._shutdown_event.is_set():
+                return
+
+            # 更新进度
+            task.progress = 0.2
+            self.schedule_gui_update(self.update_queue_display)
+
+            # 执行转换
+            do_parse(
+                output_dir=output_dir,
+                pdf_file_names=[file_name],
+                pdf_bytes_list=[pdf_bytes],
+                p_lang_list=[lang],
+                backend=backend,
+                parse_method=method,
+                formula_enable=formula_enable,
+                table_enable=table_enable,
+                start_page_id=start_page_id,
+                end_page_id=end_page_id,
+            )
+
+            # 完成
+            task.progress = 1.0
+            self.schedule_gui_update(self.update_queue_display)
+
+        except Exception as e:
+            # 重新抛出异常，让上层处理
+            raise e
+        finally:
+            # 清理资源
+            if pdf_bytes:
+                # 如果pdf_bytes有close方法，调用它
+                try:
+                    if hasattr(pdf_bytes, 'close'):
+                        pdf_bytes.close()
+                except Exception:
+                    pass
     
     def cancel_conversion(self):
         """取消转换"""
         if self.is_converting:
             self.log("⚠️ 取消队列处理请求已发送...", switch_to_log=True)
             self.is_converting = False
+            self._shutdown_event.set()  # 设置关闭事件
             self.convert_btn.configure(state="normal")
             self.add_to_queue_btn.configure(state="normal")
             self.cancel_btn.configure(state="disabled")
             self.status_var.set("已取消")
             # 取消后切换到任务队列Tab查看状态
-            self.after(300, lambda: self.tabview.set("📋 任务队列"))
+            self.schedule_gui_update(lambda: self.tabview.set("📋 任务队列"))
     
     def show_about(self):
         """显示关于对话框"""
@@ -2501,8 +2996,21 @@ class MinerUGUI(ctk.CTk):
 
 def main():
     """主函数"""
-    app = MinerUGUI()
-    app.mainloop()
+    try:
+        app = MinerUGUI()
+        app.mainloop()
+    except Exception as e:
+        # 如果GUI启动失败，提供有用的错误信息
+        print(f"GUI启动失败: {e}")
+        print("\n可能的原因:")
+        print("1. 缺少必要的Python包 (pip install customtkinter)")
+        print("2. 图形界面相关问题 (尝试使用命令行模式)")
+        print("3. 其他依赖问题")
+        print(f"\n详细错误: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
