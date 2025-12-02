@@ -372,7 +372,14 @@ class MinerUGUI(ctk.CTk):
         self._last_cleanup_check = 0
         self._cleanup_batch_size = 50  # 每次清理50个任务
 
+        # 创建界面（必须先创建，因为setup_logging需要log_text）
+        self.create_widgets()
 
+        # 配置日志输出到GUI（在create_widgets之后，确保log_text已初始化）
+        self.setup_logging()
+
+        # 绑定窗口关闭事件
+        self.protocol("WM_DELETE_WINDOW", self.on_closing)
 
     def _on_config_changed(self):
         """配置改变时的处理"""
