@@ -352,6 +352,12 @@ class MinerUGUI(ctk.CTk):
         self.task_display_start = 0  # 显示起始索引
         self.task_widgets_cache = {}  # 任务组件缓存
 
+        # 文件列表显示优化（虚拟滚动）
+        self.max_visible_files = 30  # 最多同时显示30个文件
+        self.file_display_start = 0  # 文件显示起始索引
+        self.selected_file_paths = []  # 存储已选择的文件路径列表
+        self.file_widgets_cache = {}  # 文件组件缓存
+
         # 资源管理
         self._shutdown_event = threading.Event()
         self._resource_lock = threading.Lock()
@@ -414,6 +420,9 @@ class MinerUGUI(ctk.CTk):
             # 清理任务组件缓存
             self._cleanup_task_widgets()
 
+            # 清理文件组件缓存
+            self._cleanup_file_widgets()
+
             # 清理队列更新定时器
             if self.queue_update_id:
                 try:
@@ -422,8 +431,20 @@ class MinerUGUI(ctk.CTk):
                 except Exception:
                     pass
 
+            # 清理文件更新定时器
+            if hasattr(self, 'file_update_id') and self.file_update_id:
+                try:
+                    self.after_cancel(self.file_update_id)
+                    self.file_update_id = None
+                except Exception:
+                    pass
+
             # 停止GUI更新处理器
             self._shutdown_event.set()
+
+            # 特别的打包后清理（强制清理可能残留的进程和资源）
+            if getattr(sys, 'frozen', False):
+                self._force_cleanup_for_frozen_app()
 
             self.log("应用程序已安全关闭", switch_to_log=True)
 
@@ -505,6 +526,91 @@ class MinerUGUI(ctk.CTk):
             self.task_widgets_cache.clear()
         except Exception as e:
             logger.warning(f"清理任务组件时出错: {e}")
+
+    def _cleanup_file_widgets(self):
+        """清理文件组件缓存"""
+        try:
+            for widget in self.file_widgets_cache.values():
+                if widget and widget.winfo_exists():
+                    try:
+                        widget.destroy()
+                    except Exception:
+                        pass
+            self.file_widgets_cache.clear()
+        except Exception as e:
+            logger.warning(f"清理文件组件时出错: {e}")
+
+    def _force_cleanup_for_frozen_app(self):
+        """打包后程序的强制清理"""
+        try:
+            # 强制垃圾回收
+            import gc
+            gc.collect()
+
+            # 清理可能的PyTorch缓存
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+            except Exception:
+                pass
+
+            # 清理可能的OpenCV缓存
+            try:
+                import cv2
+                cv2.destroyAllWindows()
+            except Exception:
+                pass
+
+            # 清理可能的matplotlib后端
+            try:
+                import matplotlib
+                matplotlib.pyplot.close('all')
+            except Exception:
+                pass
+
+            # 强制清理所有线程
+            import threading
+            current_thread = threading.current_thread()
+            for thread in threading.enumerate():
+                if thread != current_thread and thread.is_alive():
+                    try:
+                        # 给线程一点时间来自行结束
+                        thread.join(timeout=1.0)
+                    except Exception:
+                        pass
+
+            # 在Windows上，尝试清理可能的进程残留
+            if sys.platform == 'win32':
+                try:
+                    import psutil
+                    import os
+                    current_pid = os.getpid()
+                    current_process = psutil.Process(current_pid)
+
+                    # 清理子进程
+                    for child in current_process.children(recursive=True):
+                        try:
+                            if child.is_running():
+                                child.terminate()
+                                child.wait(timeout=2)
+                        except Exception:
+                            try:
+                                child.kill()
+                            except Exception:
+                                pass
+
+                except ImportError:
+                    pass  # psutil不可用
+                except Exception:
+                    pass  # 清理失败，继续
+
+            # 最后一次垃圾回收
+            gc.collect()
+
+        except Exception as e:
+            logger.warning(f"强制清理时出错: {e}")
 
     def _check_memory_usage(self):
         """检查内存使用情况"""
@@ -906,23 +1012,65 @@ class MinerUGUI(ctk.CTk):
         # 已选文件列表显示
         files_info_frame = ctk.CTkFrame(file_group)
         files_info_frame.pack(fill="x", padx=15, pady=(0, 15))
-        
+
         ctk.CTkLabel(
             files_info_frame,
             text="已选择文件:",
             font=ctk.CTkFont(size=12, weight="bold")
         ).pack(anchor="w", padx=10, pady=(10, 5))
-        
-        self.selected_files_var = ctk.StringVar(value="未选择文件")
-        files_label = ctk.CTkLabel(
+
+        # 文件统计信息
+        self.files_info_var = ctk.StringVar(value="未选择文件")
+        files_info_label = ctk.CTkLabel(
             files_info_frame,
-            textvariable=self.selected_files_var,
+            textvariable=self.files_info_var,
             font=ctk.CTkFont(size=11),
             anchor="w",
-            justify="left",
-            wraplength=800
+            text_color=("gray70", "gray50")
         )
-        files_label.pack(anchor="w", padx=10, pady=(0, 10))
+        files_info_label.pack(anchor="w", padx=10, pady=(0, 5))
+
+        # 文件列表显示区域（使用滚动框架）
+        self.files_scroll_frame = ctk.CTkScrollableFrame(files_info_frame, height=200)
+        self.files_scroll_frame.pack(fill="x", padx=10, pady=(0, 10))
+
+        # 分页控制（仅在文件数量超过限制时显示）
+        self.files_pagination_frame = ctk.CTkFrame(files_info_frame, fg_color="transparent")
+        self.files_pagination_frame.pack(fill="x", padx=10, pady=(0, 10))
+
+        self.files_page_info_var = ctk.StringVar(value="")
+        self.files_page_info_label = ctk.CTkLabel(
+            self.files_pagination_frame,
+            textvariable=self.files_page_info_var,
+            font=ctk.CTkFont(size=11),
+            text_color=("gray50", "gray50")
+        )
+        self.files_page_info_label.pack(side="left", padx=5)
+
+        self.files_prev_page_btn = ctk.CTkButton(
+            self.files_pagination_frame,
+            text="◀ 上一页",
+            command=self.files_prev_page,
+            width=80,
+            height=25,
+            font=ctk.CTkFont(size=10),
+            state="disabled"
+        )
+        self.files_prev_page_btn.pack(side="left", padx=2)
+
+        self.files_next_page_btn = ctk.CTkButton(
+            self.files_pagination_frame,
+            text="下一页 ▶",
+            command=self.files_next_page,
+            width=80,
+            height=25,
+            font=ctk.CTkFont(size=10),
+            state="disabled"
+        )
+        self.files_next_page_btn.pack(side="left", padx=2)
+
+        # 初始化文件显示
+        self.update_files_display()
         
         # 输出目录区域
         output_group = ctk.CTkFrame(scroll_frame)
@@ -1468,7 +1616,10 @@ class MinerUGUI(ctk.CTk):
             ]
         )
         if file_path:
-            self.selected_files_var.set(file_path)
+            file_path_obj = Path(file_path)
+            self.selected_file_paths = [file_path_obj]
+            self.file_display_start = 0  # 重置分页
+            self.update_files_display()
             # 选择文件后不切换Tab，保持在当前界面
             self.log(f"已选择文件: {file_path}", switch_to_log=False)
     
@@ -1483,8 +1634,9 @@ class MinerUGUI(ctk.CTk):
             ]
         )
         if file_paths:
-            files_str = "\n".join(file_paths)
-            self.selected_files_var.set(files_str)
+            self.selected_file_paths = [Path(fp) for fp in file_paths]
+            self.file_display_start = 0  # 重置分页
+            self.update_files_display()
             # 选择多文件后，提示用户添加到队列，不切换Tab
             self.log(f"已选择 {len(file_paths)} 个文件，请点击「添加到队列」按钮", switch_to_log=False)
             # 自动切换到基本设置Tab，方便用户看到已选文件
@@ -1497,8 +1649,9 @@ class MinerUGUI(ctk.CTk):
             folder_path = Path(dir_path)
             pdf_files = list(folder_path.glob("*.pdf"))
             if pdf_files:
-                files_str = "\n".join(str(f) for f in pdf_files)
-                self.selected_files_var.set(files_str)
+                self.selected_file_paths = pdf_files
+                self.file_display_start = 0  # 重置分页
+                self.update_files_display()
                 # 选择文件夹后，提示用户添加到队列，不切换Tab
                 self.log(f"从文件夹选择了 {len(pdf_files)} 个PDF文件，请点击「添加到队列」按钮", switch_to_log=False)
                 # 保持在基本设置Tab
@@ -1516,14 +1669,13 @@ class MinerUGUI(ctk.CTk):
     
     def add_files_to_queue(self):
         """将选中的文件添加到队列"""
-        files_str = self.selected_files_var.get()
-        if not files_str or files_str == "未选择文件":
+        if not self.selected_file_paths:
             self.log("❌ 错误: 请先选择文件", switch_to_log=True)
             return
-        
-        # 解析文件路径
-        file_paths = [Path(f.strip()) for f in files_str.split("\n") if f.strip()]
-        
+
+        # 使用已存储的文件路径列表
+        file_paths = self.selected_file_paths
+
         # 验证文件
         valid_files = []
         invalid_count = 0
@@ -1868,9 +2020,162 @@ class MinerUGUI(ctk.CTk):
                     return
                 self.task_queue.pop(index)
                 self.log(f"✅ 已删除任务: {task.file_name}", switch_to_log=False)
-        
+
         self.update_queue_display()
         # 保持在任务队列Tab
+
+    def update_files_display(self):
+        """更新文件显示（使用虚拟翻页）"""
+        try:
+            # 安全地清空现有显示
+            try:
+                children = list(self.files_scroll_frame.winfo_children())
+                for widget in children:
+                    try:
+                        if widget.winfo_exists():
+                            widget.destroy()
+                    except Exception:
+                        pass  # 忽略已销毁的组件错误
+            except Exception:
+                pass  # 忽略清空时的错误
+
+            files_count = len(self.selected_file_paths)
+
+            if files_count == 0:
+                self.files_info_var.set("未选择文件")
+                self.files_page_info_var.set("")
+                self.files_prev_page_btn.configure(state="disabled")
+                self.files_next_page_btn.configure(state="disabled")
+                try:
+                    empty_label = ctk.CTkLabel(
+                        self.files_scroll_frame,
+                        text="请先选择文件",
+                        font=ctk.CTkFont(size=12),
+                        text_color=("gray50", "gray50")
+                    )
+                    empty_label.pack(pady=20)
+                except Exception:
+                    pass
+            else:
+                self.files_info_var.set(f"已选择 {files_count} 个文件")
+
+                # 优化：如果文件数量超过限制，使用分页显示
+                if files_count > self.max_visible_files:
+                    # 计算分页信息
+                    total_pages = (files_count + self.max_visible_files - 1) // self.max_visible_files
+                    current_page = (self.file_display_start // self.max_visible_files) + 1
+
+                    # 确保起始索引有效
+                    if self.file_display_start >= files_count:
+                        self.file_display_start = max(0, files_count - self.max_visible_files)
+                    if self.file_display_start < 0:
+                        self.file_display_start = 0
+
+                    # 计算显示范围
+                    display_end = min(self.file_display_start + self.max_visible_files, files_count)
+                    display_files = self.selected_file_paths[self.file_display_start:display_end]
+
+                    # 更新分页信息
+                    self.files_page_info_var.set(f"显示 {self.file_display_start + 1}-{display_end} / {files_count} (第 {current_page}/{total_pages} 页)")
+                    self.files_prev_page_btn.configure(state="normal" if self.file_display_start > 0 else "disabled")
+                    self.files_next_page_btn.configure(state="normal" if display_end < files_count else "disabled")
+
+                    # 显示提示信息
+                    try:
+                        hint_label = ctk.CTkLabel(
+                            self.files_scroll_frame,
+                            text="💡 文件数量较多，仅显示部分文件。使用分页按钮查看更多。",
+                            font=ctk.CTkFont(size=10),
+                            text_color=("gray50", "gray50"),
+                            anchor="w"
+                        )
+                        hint_label.pack(fill="x", padx=5, pady=5)
+                    except Exception:
+                        pass
+
+                    # 显示范围内的文件
+                    for local_idx, file_path in enumerate(display_files):
+                        global_idx = self.file_display_start + local_idx
+                        try:
+                            self.create_file_widget(global_idx, file_path)
+                        except Exception:
+                            pass  # 忽略单个文件创建错误
+                else:
+                    # 文件数量较少，显示所有文件
+                    self.files_page_info_var.set("")
+                    self.files_prev_page_btn.configure(state="disabled")
+                    self.files_next_page_btn.configure(state="disabled")
+
+                    # 显示所有文件
+                    for idx, file_path in enumerate(self.selected_file_paths):
+                        try:
+                            self.create_file_widget(idx, file_path)
+                        except Exception:
+                            pass  # 忽略单个文件创建错误
+        except Exception:
+            pass  # 忽略所有更新错误，避免崩溃
+
+    def create_file_widget(self, index: int, file_path: Path):
+        """创建文件显示组件"""
+        try:
+            file_frame = ctk.CTkFrame(self.files_scroll_frame)
+            file_frame.pack(fill="x", pady=2, padx=5)
+
+            # 文件信息行
+            info_row = ctk.CTkFrame(file_frame, fg_color="transparent")
+            info_row.pack(fill="x", padx=5, pady=3)
+
+            # 文件编号和文件名
+            file_name_text = f"#{index + 1} {file_path.name}"
+
+            # 显示文件大小（如果存在）
+            try:
+                if file_path.exists():
+                    size_bytes = file_path.stat().st_size
+                    size_mb = size_bytes / (1024 * 1024)
+                    file_name_text += f" ({size_mb:.2f} MB)"
+            except Exception:
+                pass
+
+            file_label = ctk.CTkLabel(
+                info_row,
+                text=file_name_text,
+                font=ctk.CTkFont(size=11, weight="bold"),
+                anchor="w"
+            )
+            file_label.pack(side="left", fill="x", expand=True)
+
+            # 文件类型图标
+            file_type = file_path.suffix.lower()
+            type_icon = "📄" if file_type == ".pdf" else "🖼️"
+            type_label = ctk.CTkLabel(
+                info_row,
+                text=type_icon,
+                font=ctk.CTkFont(size=12)
+            )
+            type_label.pack(side="right", padx=5)
+
+            # 删除按钮（如果需要）
+            # 可以在这里添加删除单个文件的按钮
+
+        except Exception:
+            pass  # 忽略单个文件组件创建错误
+
+    def files_prev_page(self):
+        """显示上一页文件"""
+        if self.file_display_start > 0:
+            self.file_display_start = max(0, self.file_display_start - self.max_visible_files)
+            self.update_files_display()
+
+    def files_next_page(self):
+        """显示下一页文件"""
+        files_count = len(self.selected_file_paths)
+        if self.file_display_start + self.max_visible_files < files_count:
+            self.file_display_start = min(
+                self.file_display_start + self.max_visible_files,
+                files_count - self.max_visible_files
+            )
+            self.update_files_display()
     
     def log(self, message: str, switch_to_log: bool = False):
         """添加日志消息

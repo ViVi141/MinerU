@@ -19,6 +19,45 @@ if sys.platform == 'win32':
     import os
     os.environ['PYTHONIOENCODING'] = 'utf-8'
 
+def check_virtual_env():
+    """检查是否在虚拟环境中运行"""
+    import sys
+
+    # 检查是否在虚拟环境中
+    in_venv = hasattr(sys, 'real_prefix') or (hasattr(sys, 'base_prefix') and sys.base_prefix != sys.prefix)
+
+    if not in_venv:
+        print("[WARN] 警告: 未检测到虚拟环境")
+        print("建议在虚拟环境中运行打包脚本以避免依赖冲突")
+        print("")
+        print("如果您有虚拟环境，请先激活它:")
+        print("Windows: .venv\\Scripts\\activate")
+        print("Linux/Mac: source .venv/bin/activate")
+        print("")
+        print("按回车键继续，或 Ctrl+C 取消...")
+        try:
+            input()
+        except KeyboardInterrupt:
+            print("\n已取消打包")
+            return False
+
+    # 检查虚拟环境中的Python路径
+    python_exe = sys.executable
+    print(f"[INFO] 使用Python: {python_exe}")
+
+    # 检查关键包是否在虚拟环境中
+    try:
+        import torch
+        torch_path = torch.__file__
+        if 'site-packages' in torch_path and python_exe not in torch_path:
+            print(f"[WARN] PyTorch路径: {torch_path}")
+            print("PyTorch可能不在当前虚拟环境中")
+    except ImportError:
+        print("[ERROR] PyTorch 未安装")
+        return False
+
+    return True
+
 def check_pyinstaller():
     """检查 PyInstaller 是否已安装"""
     try:
@@ -649,14 +688,64 @@ def restore_mineru_json(backup_file):
         backup_file.unlink()
         print("[OK] 已恢复原始配置文件")
 
+def analyze_package_size():
+    """分析打包体积，显示优化建议"""
+    print("=" * 60)
+    print("📊 打包体积分析")
+    print("=" * 60)
+
+    # 分析模型文件大小
+    pipeline_dir = Path("models/pipeline")
+    if pipeline_dir.exists():
+        total_size = sum(f.stat().st_size for f in pipeline_dir.rglob('*') if f.is_file())
+        size_gb = total_size / (1024**3)
+        print(f"📁 Pipeline模型目录: {size_gb:.2f} GB")
+
+        # 分析子目录
+        for subdir in pipeline_dir.rglob('*'):
+            if subdir.is_dir():
+                sub_size = sum(f.stat().st_size for f in subdir.rglob('*') if f.is_file())
+                if sub_size > 0:
+                    sub_size_mb = sub_size / (1024**2)
+                    print(f"  └─ {subdir.name}: {sub_size_mb:.1f} MB")
+
+    # 分析其他大文件
+    other_dirs = [
+        ("mineru/resources", "MinerU资源"),
+        (".venv/Lib/site-packages", "虚拟环境包"),
+    ]
+
+    for dir_path, desc in other_dirs:
+        path = Path(dir_path)
+        if path.exists():
+            total_size = sum(f.stat().st_size for f in path.rglob('*') if f.is_file())
+            size_gb = total_size / (1024**3)
+            if size_gb > 0.1:  # 只显示大于100MB的目录
+                print(f"📁 {desc}: {size_gb:.2f} GB")
+
+    print("=" * 60)
+    print("💡 体积优化建议:")
+    print("• 已排除多语言OCR模型（仅保留中英文）")
+    print("• 已排除VLM相关大型依赖")
+    print("• 已启用UPX压缩和strip处理")
+    print("• 已优化数据文件包含列表")
+    print("=" * 60)
+
 def build_exe():
     """执行打包"""
     project_dir = Path(__file__).parent
-    
+
     print("=" * 60)
-    print("MinerU GUI 打包脚本（目录模式）")
+    print("MinerU GUI 打包脚本（优化版 - 体积减小）")
     print("=" * 60)
-    
+
+    # 分析打包体积
+    analyze_package_size()
+
+    # 检查虚拟环境
+    if not check_virtual_env():
+        return False
+
     # 检查 PyInstaller
     if not check_pyinstaller():
         return False
