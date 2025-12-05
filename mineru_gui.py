@@ -308,6 +308,92 @@ class TaskStatus(Enum):
     CANCELLED = "已取消"
 
 
+class ErrorCategory(Enum):
+    """错误类别枚举"""
+    FILE_IO = "文件操作错误"
+    CONFIGURATION = "配置错误"
+    NETWORK = "网络错误"
+    PERMISSION = "权限错误"
+    MEMORY = "内存错误"
+    MODEL = "模型错误"
+    VALIDATION = "验证错误"
+    UNKNOWN = "未知错误"
+
+
+class MinerUErrorHandler:
+    """统一的错误处理工具类"""
+    
+    @staticmethod
+    def classify_exception(exc: Exception) -> tuple[ErrorCategory, str]:
+        """分类异常并生成用户友好的错误消息"""
+        error_msg = str(exc)
+        
+        # 文件操作错误
+        if isinstance(exc, (FileNotFoundError, IOError, OSError)):
+            if "No such file" in error_msg or "找不到文件" in error_msg:
+                return ErrorCategory.FILE_IO, f"文件未找到: {error_msg}\n请检查文件路径是否正确"
+            elif "Permission denied" in error_msg or "权限" in error_msg:
+                return ErrorCategory.PERMISSION, f"权限不足: {error_msg}\n请检查文件或目录的读写权限"
+            elif "Disk" in error_msg or "磁盘" in error_msg or "空间" in error_msg:
+                return ErrorCategory.FILE_IO, f"磁盘空间不足: {error_msg}\n请清理磁盘空间后重试"
+            else:
+                return ErrorCategory.FILE_IO, f"文件操作失败: {error_msg}"
+        
+        # 配置错误
+        elif isinstance(exc, (ValueError, KeyError, AttributeError)):
+            if "config" in error_msg.lower() or "配置" in error_msg:
+                return ErrorCategory.CONFIGURATION, f"配置错误: {error_msg}\n请检查配置文件或参数设置"
+            elif "validation" in error_msg.lower() or "验证" in error_msg:
+                return ErrorCategory.VALIDATION, f"参数验证失败: {error_msg}\n请检查输入参数"
+            else:
+                return ErrorCategory.VALIDATION, f"参数错误: {error_msg}"
+        
+        # 内存错误
+        elif isinstance(exc, MemoryError):
+            return ErrorCategory.MEMORY, f"内存不足: {error_msg}\n建议关闭其他程序或减小处理文件大小"
+        
+        # 网络错误（如果有）
+        elif isinstance(exc, (ConnectionError, TimeoutError)):
+            return ErrorCategory.NETWORK, f"网络连接失败: {error_msg}\n请检查网络连接或稍后重试"
+        
+        # 模型相关错误
+        elif "model" in error_msg.lower() or "模型" in error_msg or "torch" in error_msg.lower():
+            return ErrorCategory.MODEL, f"模型加载/运行错误: {error_msg}\n请检查模型文件是否完整"
+        
+        # 默认未知错误
+        else:
+            error_type = type(exc).__name__
+            return ErrorCategory.UNKNOWN, f"发生错误: {error_msg}\n错误类型: {error_type}"
+    
+    @staticmethod
+    def format_error_message(exc: Exception, context: str = "") -> str:
+        """格式化错误消息，包含上下文信息"""
+        category, user_msg = MinerUErrorHandler.classify_exception(exc)
+        
+        result = f"【{category.value}】{user_msg}"
+        if context:
+            result += f"\n上下文: {context}"
+        
+        return result
+    
+    @staticmethod
+    def should_retry(exc: Exception) -> bool:
+        """判断错误是否可重试"""
+        error_msg = str(exc).lower()
+        
+        # 网络错误通常可重试
+        if isinstance(exc, (ConnectionError, TimeoutError)):
+            return True
+        
+        # 临时文件错误可能可重试
+        if isinstance(exc, (IOError, OSError)):
+            if "temporary" in error_msg or "临时" in error_msg:
+                return True
+        
+        # 其他错误通常不可重试
+        return False
+
+
 @dataclass
 class ConversionTask:
     """转换任务数据类"""
@@ -321,6 +407,8 @@ class ConversionTask:
     page_count: int = 0  # PDF页数
     total_time: float = 0.0  # 总处理时间（秒）
     time_per_page: float = 0.0  # 每页处理时间（秒）
+    retry_count: int = 0  # 重试次数
+    max_retries: int = 3  # 最大重试次数
 
 
 class MinerUGUI(ctk.CTk):
@@ -473,6 +561,77 @@ class MinerUGUI(ctk.CTk):
                 finally:
                     self._active_resources.discard(resource)
 
+    def _calculate_queue_stats(self):
+        """计算队列统计信息（优化：单次遍历）"""
+        pending = processing = completed = failed = 0
+        for task in self.task_queue:
+            if task.status == TaskStatus.PENDING:
+                pending += 1
+            elif task.status == TaskStatus.PROCESSING:
+                processing += 1
+            elif task.status == TaskStatus.COMPLETED:
+                completed += 1
+            elif task.status == TaskStatus.FAILED:
+                failed += 1
+        return pending, processing, completed, failed
+    
+    def _extract_method_code(self, method_display: str) -> str:
+        """从显示名称中提取实际的方法代码"""
+        if 'auto' in method_display:
+            return 'auto'
+        elif 'txt' in method_display:
+            return 'txt'
+        elif 'ocr' in method_display:
+            return 'ocr'
+        else:
+            return method_display
+    
+    def _extract_lang_code(self, lang_display: str) -> str:
+        """从显示名称中提取实际的语言代码"""
+        return lang_display.split()[0] if ' ' in lang_display else lang_display
+    
+    def _parse_page_range(self) -> tuple[int, Optional[int]]:
+        """解析页码范围配置，并进行边界检查"""
+        try:
+            start_page_id = int(self.start_page_var.get()) if self.start_page_var.get() else 0
+            # 边界检查：页码必须 >= 0
+            if start_page_id < 0:
+                start_page_id = 0
+        except (ValueError, TypeError):
+            start_page_id = 0
+        
+        try:
+            end_page_id_str = self.end_page_var.get()
+            if end_page_id_str:
+                end_page_id = int(end_page_id_str)
+                # 边界检查：结束页码必须 >= 开始页码
+                if end_page_id < start_page_id:
+                    end_page_id = None  # 无效范围，忽略
+            else:
+                end_page_id = None
+        except (ValueError, TypeError):
+            end_page_id = None
+        
+        return start_page_id, end_page_id
+    
+    def _get_task_config(self) -> dict:
+        """获取任务配置参数（统一提取配置）"""
+        method_display = self.method_var.get()
+        lang_display = self.lang_var.get()
+        start_page_id, end_page_id = self._parse_page_range()  # 只调用一次
+        
+        return {
+            'output_dir': self.output_path_var.get(),
+            'backend': self.backend_var.get(),
+            'method': self._extract_method_code(method_display),
+            'lang': self._extract_lang_code(lang_display),
+            'formula_enable': self.formula_var.get(),
+            'table_enable': self.table_var.get(),
+            'start_page_id': start_page_id,
+            'end_page_id': end_page_id,
+            'device_mode': self.device_var.get().strip() or None,
+        }
+
     def _update_queue_info_only(self):
         """仅更新队列统计信息，不重新创建组件"""
         try:
@@ -485,10 +644,7 @@ class MinerUGUI(ctk.CTk):
                     self.prev_page_btn.configure(state="disabled")
                     self.next_page_btn.configure(state="disabled")
                 else:
-                    pending = sum(1 for t in self.task_queue if t.status == TaskStatus.PENDING)
-                    processing = sum(1 for t in self.task_queue if t.status == TaskStatus.PROCESSING)
-                    completed = sum(1 for t in self.task_queue if t.status == TaskStatus.COMPLETED)
-                    failed = sum(1 for t in self.task_queue if t.status == TaskStatus.FAILED)
+                    pending, processing, completed, failed = self._calculate_queue_stats()
 
                     self.queue_info_var.set(
                         f"队列: {queue_size} 个任务 | "
@@ -677,13 +833,22 @@ class MinerUGUI(ctk.CTk):
 
                 if len(completed_tasks) > max_completed:
                     # 需要清理的任务数量
-                    to_remove_count = len(completed_tasks) - self._max_completed_tasks
+                    to_remove_count = len(completed_tasks) - max_completed
 
                     # 按完成时间排序，保留最新的
                     completed_tasks.sort(key=lambda t: t.end_time or datetime.min, reverse=True)
 
                     # 获取需要删除的任务
                     tasks_to_remove = completed_tasks[-to_remove_count:]
+
+                    # 在删除前查找任务索引（用于清理组件缓存）
+                    task_ids_to_remove = []
+                    for task in tasks_to_remove:
+                        # 找到任务在原始队列中的索引作为ID
+                        for i, t in enumerate(self.task_queue):
+                            if t == task:
+                                task_ids_to_remove.append(i)
+                                break
 
                     # 从队列中移除这些任务
                     original_length = len(self.task_queue)
@@ -695,14 +860,6 @@ class MinerUGUI(ctk.CTk):
                         self.log(f"🧹 已自动清理 {removed_count} 个旧的已完成任务", switch_to_log=False)
 
                         # 清理相关的组件缓存
-                        task_ids_to_remove = []
-                        for task in tasks_to_remove:
-                            # 找到任务在原始队列中的索引作为ID
-                            for i, t in enumerate(self.task_queue):
-                                if t == task:
-                                    task_ids_to_remove.append(i)
-                                    break
-
                         for task_id in task_ids_to_remove:
                             self.task_widgets_cache.pop(task_id, None)
 
@@ -1607,57 +1764,147 @@ class MinerUGUI(ctk.CTk):
     
     def select_single_file(self):
         """选择单个PDF文件"""
-        file_path = filedialog.askopenfilename(
-            title="选择PDF文件",
-            filetypes=[
-                ("PDF文件", "*.pdf"),
-                ("图片文件", "*.png *.jpg *.jpeg"),
-                ("所有文件", "*.*")
-            ]
-        )
-        if file_path:
-            file_path_obj = Path(file_path)
-            self.selected_file_paths = [file_path_obj]
-            self.file_display_start = 0  # 重置分页
-            self.update_files_display()
-            # 选择文件后不切换Tab，保持在当前界面
-            self.log(f"已选择文件: {file_path}", switch_to_log=False)
+        try:
+            file_path = filedialog.askopenfilename(
+                title="选择PDF文件",
+                filetypes=[
+                    ("PDF文件", "*.pdf"),
+                    ("图片文件", "*.png *.jpg *.jpeg"),
+                    ("所有文件", "*.*")
+                ]
+            )
+            if file_path:
+                file_path_obj = Path(file_path)
+                
+                # 验证文件
+                if not file_path_obj.exists():
+                    error_msg = MinerUErrorHandler.format_error_message(
+                        FileNotFoundError(f"文件不存在: {file_path}"),
+                        context="选择文件"
+                    )
+                    self.log(f"❌ {error_msg}", switch_to_log=True)
+                    return
+                
+                # 检查文件大小
+                try:
+                    file_size = file_path_obj.stat().st_size
+                    if file_size == 0:
+                        self.log(f"⚠️ 警告: 文件为空: {file_path}", switch_to_log=False)
+                    elif file_size > 500 * 1024 * 1024:  # 500MB
+                        self.log(f"⚠️ 警告: 文件较大 ({file_size / 1024 / 1024:.1f}MB)，处理可能需要较长时间", switch_to_log=False)
+                except Exception as e:
+                    logger.warning(f"检查文件大小时出错: {e}")
+                
+                self.selected_file_paths = [file_path_obj]
+                self.file_display_start = 0  # 重置分页
+                self.update_files_display()
+                # 选择文件后不切换Tab，保持在当前界面
+                self.log(f"✅ 已选择文件: {file_path}", switch_to_log=False)
+        except Exception as e:
+            error_handler = MinerUErrorHandler()
+            formatted_msg = error_handler.format_error_message(e, context="选择文件")
+            self.log(f"❌ {formatted_msg}", switch_to_log=True)
+            logger.exception("选择文件时出错")
     
     def select_multiple_files(self):
         """选择多个PDF文件"""
-        file_paths = filedialog.askopenfilenames(
-            title="选择多个PDF文件",
-            filetypes=[
-                ("PDF文件", "*.pdf"),
-                ("图片文件", "*.png *.jpg *.jpeg"),
-                ("所有文件", "*.*")
-            ]
-        )
-        if file_paths:
-            self.selected_file_paths = [Path(fp) for fp in file_paths]
-            self.file_display_start = 0  # 重置分页
-            self.update_files_display()
-            # 选择多文件后，提示用户添加到队列，不切换Tab
-            self.log(f"已选择 {len(file_paths)} 个文件，请点击「添加到队列」按钮", switch_to_log=False)
-            # 自动切换到基本设置Tab，方便用户看到已选文件
-            self.tabview.set("📋 基本设置")
+        try:
+            file_paths = filedialog.askopenfilenames(
+                title="选择多个PDF文件",
+                filetypes=[
+                    ("PDF文件", "*.pdf"),
+                    ("图片文件", "*.png *.jpg *.jpeg"),
+                    ("所有文件", "*.*")
+                ]
+            )
+            if file_paths:
+                valid_paths = []
+                invalid_count = 0
+                
+                for fp in file_paths:
+                    try:
+                        file_path_obj = Path(fp)
+                        if not file_path_obj.exists():
+                            invalid_count += 1
+                            logger.warning(f"文件不存在: {fp}")
+                            continue
+                        valid_paths.append(file_path_obj)
+                    except Exception as e:
+                        invalid_count += 1
+                        logger.warning(f"处理文件路径时出错 {fp}: {e}")
+                
+                if invalid_count > 0:
+                    self.log(f"⚠️ 警告: {invalid_count} 个文件无效或不存在，已忽略", switch_to_log=False)
+                
+                if valid_paths:
+                    self.selected_file_paths = valid_paths
+                    self.file_display_start = 0  # 重置分页
+                    self.update_files_display()
+                    # 选择多文件后，提示用户添加到队列，不切换Tab
+                    self.log(f"✅ 已选择 {len(valid_paths)} 个有效文件，请点击「添加到队列」按钮", switch_to_log=False)
+                    # 自动切换到基本设置Tab，方便用户看到已选文件
+                    try:
+                        self.tabview.set("📋 基本设置")
+                    except Exception:
+                        pass  # 如果Tab切换失败，忽略
+                else:
+                    self.log("❌ 错误: 没有有效的文件被选择", switch_to_log=True)
+        except Exception as e:
+            error_handler = MinerUErrorHandler()
+            formatted_msg = error_handler.format_error_message(e, context="选择多个文件")
+            self.log(f"❌ {formatted_msg}", switch_to_log=True)
+            logger.exception("选择多个文件时出错")
     
     def select_folder(self):
         """选择文件夹"""
-        dir_path = filedialog.askdirectory(title="选择包含PDF文件的文件夹")
-        if dir_path:
-            folder_path = Path(dir_path)
-            pdf_files = list(folder_path.glob("*.pdf"))
-            if pdf_files:
-                self.selected_file_paths = pdf_files
-                self.file_display_start = 0  # 重置分页
-                self.update_files_display()
-                # 选择文件夹后，提示用户添加到队列，不切换Tab
-                self.log(f"从文件夹选择了 {len(pdf_files)} 个PDF文件，请点击「添加到队列」按钮", switch_to_log=False)
-                # 保持在基本设置Tab
-                self.tabview.set("📋 基本设置")
-            else:
-                self.log(f"文件夹中没有找到PDF文件: {dir_path}", switch_to_log=False)
+        try:
+            dir_path = filedialog.askdirectory(title="选择包含PDF文件的文件夹")
+            if dir_path:
+                folder_path = Path(dir_path)
+                
+                # 验证文件夹是否存在
+                if not folder_path.exists():
+                    error_msg = MinerUErrorHandler.format_error_message(
+                        FileNotFoundError(f"文件夹不存在: {dir_path}"),
+                        context="选择文件夹"
+                    )
+                    self.log(f"❌ {error_msg}", switch_to_log=True)
+                    return
+                
+                # 验证是否有读取权限
+                if not os.access(folder_path, os.R_OK):
+                    error_msg = MinerUErrorHandler.format_error_message(
+                        PermissionError(f"没有读取权限: {dir_path}"),
+                        context="选择文件夹"
+                    )
+                    self.log(f"❌ {error_msg}", switch_to_log=True)
+                    return
+                
+                try:
+                    pdf_files = list(folder_path.glob("*.pdf"))
+                    if pdf_files:
+                        self.selected_file_paths = pdf_files
+                        self.file_display_start = 0  # 重置分页
+                        self.update_files_display()
+                        # 选择文件夹后，提示用户添加到队列，不切换Tab
+                        self.log(f"✅ 从文件夹选择了 {len(pdf_files)} 个PDF文件，请点击「添加到队列」按钮", switch_to_log=False)
+                        # 保持在基本设置Tab
+                        try:
+                            self.tabview.set("📋 基本设置")
+                        except Exception:
+                            pass  # 如果Tab切换失败，忽略
+                    else:
+                        self.log(f"ℹ️ 文件夹中没有找到PDF文件: {dir_path}", switch_to_log=False)
+                except Exception as e:
+                    error_handler = MinerUErrorHandler()
+                    formatted_msg = error_handler.format_error_message(e, context="扫描文件夹")
+                    self.log(f"❌ 扫描文件夹时出错: {formatted_msg}", switch_to_log=True)
+                    logger.exception(f"扫描文件夹时出错: {dir_path}")
+        except Exception as e:
+            error_handler = MinerUErrorHandler()
+            formatted_msg = error_handler.format_error_message(e, context="选择文件夹")
+            self.log(f"❌ {formatted_msg}", switch_to_log=True)
+            logger.exception("选择文件夹时出错")
     
     def select_output_dir(self):
         """选择输出目录"""
@@ -1669,80 +1916,134 @@ class MinerUGUI(ctk.CTk):
     
     def add_files_to_queue(self):
         """将选中的文件添加到队列"""
-        if not self.selected_file_paths:
-            self.log("❌ 错误: 请先选择文件", switch_to_log=True)
-            return
-
-        # 使用已存储的文件路径列表
-        file_paths = self.selected_file_paths
-
-        # 验证文件
-        valid_files = []
-        invalid_count = 0
-        for file_path in file_paths:
-            if not file_path.exists():
-                invalid_count += 1
-                continue
-            if file_path.suffix.lower() not in ['.pdf', '.png', '.jpg', '.jpeg']:
-                invalid_count += 1
-                continue
-            valid_files.append(file_path)
-        
-        if not valid_files:
-            self.log("❌ 错误: 没有有效的文件可以添加到队列", switch_to_log=True)
-            return
-        
-        # 添加到队列（分批处理，避免一次性创建过多组件）
-        added_count = 0
-        with self.queue_lock:
-            batch_size = 100  # 每批最多添加100个文件
-
-            # 使用UI设置的最大队列大小
-            max_queue_size = self.max_queue_size_var.get() if hasattr(self, 'max_queue_size_var') else 2000
-
-            # 检查当前队列大小
-            current_queue_size = len(self.task_queue)
-            if current_queue_size >= max_queue_size:
-                self.log(f"⚠️ 队列已满（最多{max_queue_size}个任务），无法添加新文件", switch_to_log=False)
+        try:
+            if not self.selected_file_paths:
+                self.log("❌ 错误: 请先选择文件", switch_to_log=True)
                 return
 
-            # 计算可以添加的最大文件数
-            available_slots = max_queue_size - current_queue_size
-            files_to_add = min(len(valid_files), available_slots)
+            # 使用已存储的文件路径列表
+            file_paths = self.selected_file_paths
 
-            if files_to_add < len(valid_files):
-                self.log(f"⚠️ 队列空间不足，只添加前{files_to_add}个文件", switch_to_log=False)
+            # 验证文件
+            valid_files = []
+            invalid_files = []
+            
+            for file_path in file_paths:
+                try:
+                    # 检查文件是否存在
+                    if not file_path.exists():
+                        invalid_files.append((file_path, "文件不存在"))
+                        continue
+                    
+                    # 检查文件扩展名
+                    if file_path.suffix.lower() not in ['.pdf', '.png', '.jpg', '.jpeg']:
+                        invalid_files.append((file_path, f"不支持的文件类型: {file_path.suffix}"))
+                        continue
+                    
+                    # 检查文件大小（防止添加过大或空文件）
+                    try:
+                        file_size = file_path.stat().st_size
+                        if file_size == 0:
+                            invalid_files.append((file_path, "文件为空"))
+                            continue
+                        # 文件太大也允许，但会警告
+                        if file_size > 1000 * 1024 * 1024:  # 1GB
+                            logger.warning(f"文件较大 ({file_size / 1024 / 1024:.1f}MB): {file_path}")
+                    except Exception as e:
+                        logger.warning(f"检查文件大小时出错 {file_path}: {e}")
+                    
+                    # 检查文件是否可读
+                    if not os.access(file_path, os.R_OK):
+                        invalid_files.append((file_path, "没有读取权限"))
+                        continue
+                    
+                    valid_files.append(file_path)
+                except Exception as e:
+                    invalid_files.append((file_path, f"验证失败: {str(e)}"))
+                    logger.warning(f"验证文件时出错 {file_path}: {e}")
+            
+            # 报告无效文件
+            if invalid_files:
+                invalid_count = len(invalid_files)
+                self.log(f"⚠️ 警告: {invalid_count} 个文件无效，已跳过", switch_to_log=False)
+                if invalid_count <= 5:  # 只显示前5个无效文件的详情
+                    for invalid_file, reason in invalid_files[:5]:
+                        self.log(f"   - {invalid_file.name}: {reason}", switch_to_log=False)
+                else:
+                    for invalid_file, reason in invalid_files[:5]:
+                        self.log(f"   - {invalid_file.name}: {reason}", switch_to_log=False)
+                    self.log(f"   ... 还有 {invalid_count - 5} 个无效文件", switch_to_log=False)
+            
+            if not valid_files:
+                self.log("❌ 错误: 没有有效的文件可以添加到队列", switch_to_log=True)
+                if invalid_files:
+                    error_handler = MinerUErrorHandler()
+                    sample_error = invalid_files[0][1]
+                    self.log(f"   原因: {sample_error}", switch_to_log=True)
+                return
+            
+            # 添加到队列（分批处理，避免一次性创建过多组件）
+            added_count = 0
+            invalid_count = len(invalid_files) if invalid_files else 0
+            
+            with self.queue_lock:
+                batch_size = 100  # 每批最多添加100个文件
 
-            actual_files = valid_files[:files_to_add]
+                # 使用UI设置的最大队列大小
+                max_queue_size = self.max_queue_size_var.get() if hasattr(self, 'max_queue_size_var') else 2000
 
-            for i in range(0, len(actual_files), batch_size):
-                batch = actual_files[i:i + batch_size]
-                for file_path in batch:
-                    task = ConversionTask(
-                        file_path=file_path,
-                        file_name=file_path.stem
-                    )
-                    self.task_queue.append(task)
-                    added_count += 1
+                # 检查当前队列大小
+                current_queue_size = len(self.task_queue)
+                if current_queue_size >= max_queue_size:
+                    self.log(f"⚠️ 队列已满（最多{max_queue_size}个任务），无法添加新文件", switch_to_log=False)
+                    return
 
-                # 每批处理完后短暂暂停，避免阻塞UI
-                if i + batch_size < len(actual_files):
-                    self.after(10)  # 短暂让出控制权
+                # 计算可以添加的最大文件数
+                available_slots = max_queue_size - current_queue_size
+                files_to_add = min(len(valid_files), available_slots)
 
-        # 只有在添加的文件数量较少时才立即更新显示
-        if len(valid_files) <= 50:
-            self.update_queue_display()
-        else:
-            # 对于大量文件，只更新队列信息，不重新创建组件
-            self._update_queue_info_only()
+                if files_to_add < len(valid_files):
+                    self.log(f"⚠️ 队列空间不足，只添加前{files_to_add}个文件", switch_to_log=False)
 
-        self.tabview.set("📋 任务队列")
+                actual_files = valid_files[:files_to_add]
 
-        # 显示成功消息
-        if invalid_count > 0:
-            self.log(f"✅ 已添加 {added_count} 个文件到队列（已跳过 {invalid_count} 个无效文件）", switch_to_log=False)
-        else:
-            self.log(f"✅ 已添加 {added_count} 个文件到队列", switch_to_log=False)
+                for i in range(0, len(actual_files), batch_size):
+                    batch = actual_files[i:i + batch_size]
+                    for file_path in batch:
+                        task = ConversionTask(
+                            file_path=file_path,
+                            file_name=file_path.stem
+                        )
+                        self.task_queue.append(task)
+                        added_count += 1
+
+                    # 每批处理完后短暂暂停，避免阻塞UI
+                    if i + batch_size < len(actual_files):
+                        self.after(10)  # 短暂让出控制权
+
+            # 只有在添加的文件数量较少时才立即更新显示
+            if len(valid_files) <= 50:
+                self.update_queue_display()
+            else:
+                # 对于大量文件，只更新队列信息，不重新创建组件
+                self._update_queue_info_only()
+
+            try:
+                self.tabview.set("📋 任务队列")
+            except Exception:
+                pass  # 如果Tab切换失败，忽略
+
+            # 显示成功消息
+            if invalid_count > 0:
+                self.log(f"✅ 已添加 {added_count} 个文件到队列（已跳过 {invalid_count} 个无效文件）", switch_to_log=False)
+            else:
+                self.log(f"✅ 已添加 {added_count} 个文件到队列", switch_to_log=False)
+        
+        except Exception as e:
+            error_handler = MinerUErrorHandler()
+            formatted_msg = error_handler.format_error_message(e, context="添加文件到队列")
+            self.log(f"❌ {formatted_msg}", switch_to_log=True)
+            logger.exception("添加文件到队列时出错")
 
         # 如果添加了大量文件，给出提示
         if len(valid_files) > 200:
@@ -1819,10 +2120,7 @@ class MinerUGUI(ctk.CTk):
                     except Exception:
                         pass
                 else:
-                    pending = sum(1 for t in self.task_queue if t.status == TaskStatus.PENDING)
-                    processing = sum(1 for t in self.task_queue if t.status == TaskStatus.PROCESSING)
-                    completed = sum(1 for t in self.task_queue if t.status == TaskStatus.COMPLETED)
-                    failed = sum(1 for t in self.task_queue if t.status == TaskStatus.FAILED)
+                    pending, processing, completed, failed = self._calculate_queue_stats()
                     
                     self.queue_info_var.set(
                         f"队列: {queue_size} 个任务 | "
@@ -2234,21 +2532,11 @@ class MinerUGUI(ctk.CTk):
         backend = self.backend_var.get()
         self.log(f"   - 后端: {backend}", switch_to_log=True)
         
-        # 解析方法（从显示名称中提取实际代码）
-        method_display = self.method_var.get()
-        if 'auto' in method_display:
-            method = 'auto'
-        elif 'txt' in method_display:
-            method = 'txt'
-        elif 'ocr' in method_display:
-            method = 'ocr'
-        else:
-            method = method_display
+        # 使用统一的配置提取方法
+        config = self._get_task_config()
+        method = config['method']
+        lang = config['lang']
         self.log(f"   - 解析方法: {method}", switch_to_log=True)
-        
-        # 语言（从显示名称中提取实际代码）
-        lang_display = self.lang_var.get()
-        lang = lang_display.split()[0] if ' ' in lang_display else lang_display  # 提取代码部分
         self.log(f"   - 语言: {lang}", switch_to_log=True)
         
         # 功能开关
@@ -2417,16 +2705,22 @@ class MinerUGUI(ctk.CTk):
                 if not self.is_converting:
                     break
 
-                # 获取下一个待处理任务
+                # 获取下一个待处理任务（优化：直接查找索引，避免重复遍历）
                 with self.queue_lock:
-                    pending_tasks = [t for t in self.task_queue if t.status == TaskStatus.PENDING]
-                    if not pending_tasks:
+                    task_index = -1
+                    task = None
+                    # 查找第一个待处理任务的索引
+                    for idx, t in enumerate(self.task_queue):
+                        if t.status == TaskStatus.PENDING:
+                            task = t
+                            task_index = idx
+                            break
+                    
+                    if task is None or task_index < 0:
                         break
 
-                    task = pending_tasks[0]
                     task.status = TaskStatus.PROCESSING
                     task.start_time = datetime.now()
-                    task_index = self.task_queue.index(task)
                     self.current_task_index = task_index
 
                 # 检查关闭事件
@@ -2467,7 +2761,6 @@ class MinerUGUI(ctk.CTk):
                         break
 
                     # 记录开始时间
-                    import time
                     start_time = time.time()
 
                     # 处理前检查内存使用情况
@@ -2487,20 +2780,63 @@ class MinerUGUI(ctk.CTk):
                     task.status = TaskStatus.COMPLETED
                     task.end_time = datetime.now()
 
-                    # 显示完成信息，包含时间统计
+                    # 显示完成信息，包含时间统计和重试信息
+                    retry_info = ""
+                    if task.retry_count > 0:
+                        retry_info = f"，重试 {task.retry_count} 次"
+                    
                     if task.page_count > 0:
-                        time_info = f"（{task.page_count}页，总耗时: {task.total_time:.1f}秒，平均: {task.time_per_page:.2f}秒/页）"
+                        time_info = f"（{task.page_count}页，总耗时: {task.total_time:.1f}秒，平均: {task.time_per_page:.2f}秒/页{retry_info}）"
                     else:
-                        time_info = f"（总耗时: {task.total_time:.1f}秒）"
+                        time_info = f"（总耗时: {task.total_time:.1f}秒{retry_info}）"
                     self.log(f"✅ 任务 #{task_index + 1} 完成: {task.file_name} {time_info}", switch_to_log=True)
                 except Exception as e:
                     task.status = TaskStatus.FAILED
-                    task.error_message = str(e)[:200]  # 限制错误信息长度
                     task.end_time = datetime.now()
-                    self.log(f"❌ 任务 #{task_index + 1} 失败: {task.file_name}", switch_to_log=True)
-                    self.log(f"   错误: {str(e)}", switch_to_log=True)
-                    # 使用logger记录详细异常信息（会自动输出到GUI）
-                    logger.exception(f"任务 #{task_index + 1} 处理失败: {task.file_name}")
+                    
+                    # 使用统一的错误处理系统
+                    error_handler = MinerUErrorHandler()
+                    category, user_msg = error_handler.classify_exception(e)
+                    formatted_msg = error_handler.format_error_message(
+                        e, 
+                        context=f"任务 #{task_index + 1}: {task.file_name}"
+                    )
+                    
+                    # 存储用户友好的错误消息（限制长度），包含重试信息
+                    retry_info_msg = ""
+                    if task.retry_count > 0:
+                        retry_info_msg = f"（已重试 {task.retry_count} 次后失败）"
+                    task.error_message = f"{user_msg[:250]}{retry_info_msg}"[:300]
+                    
+                    # 记录用户友好的错误消息
+                    retry_status = ""
+                    if task.retry_count >= task.max_retries:
+                        retry_status = f"（已重试 {task.max_retries} 次，仍失败）"
+                    elif task.retry_count > 0:
+                        retry_status = f"（重试 {task.retry_count} 次后失败）"
+                    
+                    self.log(f"❌ 任务 #{task_index + 1} 失败: {task.file_name}{retry_status}", switch_to_log=True)
+                    self.log(f"   错误类别: {category.value}", switch_to_log=True)
+                    self.log(f"   错误详情: {user_msg}", switch_to_log=True)
+                    
+                    # 记录详细信息到日志文件（用于调试）
+                    logger.error(f"任务 #{task_index + 1} 处理失败: {task.file_name} (重试次数: {task.retry_count}/{task.max_retries})")
+                    logger.exception(f"任务 #{task_index + 1} 处理失败详情")
+                    logger.debug(f"错误分类: {category.name}, 原始异常: {type(e).__name__}: {str(e)}")
+                    
+                    # 如果已达到最大重试次数，给出最终提示并记录错误日志
+                    if task.retry_count >= task.max_retries:
+                        self.log(f"   ⚠️ 该文件无法成功转换（已重试 {task.max_retries} 次）", switch_to_log=True)
+                        self.log("   💡 建议: 请检查文件是否损坏、格式是否正确，或尝试手动处理该文件", switch_to_log=True)
+                        
+                        # 将错误信息实时保存到导出目录的错误日志文件
+                        self._write_error_to_log_file(
+                            task=task,
+                            error_category=category.value,
+                            error_message=user_msg,
+                            exception_type=type(e).__name__
+                        )
+                        self.log("   📝 错误信息已保存到导出目录的「转换错误日志.md」文件中", switch_to_log=True)
 
                 # 更新显示（使用线程安全的方法）
                 self.schedule_gui_update(self.update_queue_display)
@@ -2513,8 +2849,7 @@ class MinerUGUI(ctk.CTk):
             
             # 完成
             with self.queue_lock:
-                completed = sum(1 for t in self.task_queue if t.status == TaskStatus.COMPLETED)
-                failed = sum(1 for t in self.task_queue if t.status == TaskStatus.FAILED)
+                _, _, completed, failed = self._calculate_queue_stats()
                 total = len(self.task_queue)
                 
                 # 计算统计信息
@@ -2550,10 +2885,22 @@ class MinerUGUI(ctk.CTk):
             self.schedule_gui_update(lambda: self.tabview.set("📋 任务队列"))
             
         except Exception as e:
-            self.log(f"❌ 队列处理出错: {str(e)}", switch_to_log=True)
+            # 使用统一的错误处理系统
+            error_handler = MinerUErrorHandler()
+            formatted_msg = error_handler.format_error_message(e, context="队列处理过程")
+            
+            self.log("❌ 队列处理出错", switch_to_log=True)
+            self.log(f"   {formatted_msg}", switch_to_log=True)
+            
             # 使用logger记录详细异常信息（会自动输出到GUI）
             logger.exception("队列处理过程中发生异常")
+            logger.debug(f"错误详情: {type(e).__name__}: {str(e)}")
+            
             self.status_var.set("队列处理失败")
+            
+            # 如果是可重试的错误，给出建议
+            if error_handler.should_retry(e):
+                self.log("   💡 提示: 此错误可能可以重试，请稍后重新开始处理", switch_to_log=True)
         finally:
             # 恢复UI状态
             self.is_converting = False
@@ -2562,42 +2909,139 @@ class MinerUGUI(ctk.CTk):
             self.cancel_btn.configure(state="disabled")
             self.current_task_index = -1
     
+    def _validate_task_config(self, config: dict) -> tuple[bool, Optional[str]]:
+        """验证任务配置参数"""
+        # 验证输出目录
+        output_dir = config.get('output_dir', '').strip()
+        if not output_dir:
+            return False, "输出目录不能为空"
+        
+        output_path = Path(output_dir)
+        try:
+            # 尝试创建输出目录（如果不存在）
+            output_path.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            return False, f"无法创建输出目录: {str(e)}"
+        
+        # 验证页码范围
+        start_page_id = config.get('start_page_id', 0)
+        end_page_id = config.get('end_page_id')
+        if start_page_id < 0:
+            return False, "起始页码必须 >= 0"
+        if end_page_id is not None and end_page_id < start_page_id:
+            return False, "结束页码必须 >= 起始页码"
+        
+        return True, None
+    
+    def _write_error_to_log_file(self, task: ConversionTask, error_category: str, error_message: str, exception_type: str = ""):
+        """将失败的任务信息写入错误日志Markdown文件（实时追加）"""
+        try:
+            output_dir = self.output_path_var.get().strip()
+            if not output_dir:
+                logger.warning("输出目录为空，无法写入错误日志")
+                return
+            
+            output_path = Path(output_dir)
+            
+            # 确保输出目录存在
+            try:
+                output_path.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                logger.warning(f"无法创建输出目录 {output_path}: {e}")
+                return
+            
+            # 错误日志文件名
+            error_log_file = output_path / "转换错误日志.md"
+            
+            # 准备Markdown格式的错误记录
+            error_entry = []
+            error_entry.append("---")
+            error_entry.append(f"**失败时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            error_entry.append(f"**文件名称**: `{task.file_name}`")
+            error_entry.append(f"**文件路径**: `{task.file_path}`")
+            error_entry.append(f"**错误类别**: {error_category}")
+            
+            if exception_type:
+                error_entry.append(f"**异常类型**: `{exception_type}`")
+            
+            if task.retry_count > 0:
+                error_entry.append(f"**重试次数**: {task.retry_count}/{task.max_retries}（已尝试 {task.retry_count + 1} 次）")
+            
+            if task.start_time and task.end_time:
+                duration = (task.end_time - task.start_time).total_seconds()
+                error_entry.append(f"**开始时间**: {task.start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+                error_entry.append(f"**结束时间**: {task.end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+                error_entry.append(f"**耗时**: {duration:.2f} 秒")
+            elif task.start_time:
+                error_entry.append(f"**开始时间**: {task.start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+            
+            if task.page_count > 0:
+                error_entry.append(f"**PDF页数**: {task.page_count} 页")
+            
+            # 文件大小信息
+            try:
+                if task.file_path.exists():
+                    file_size = task.file_path.stat().st_size
+                    size_mb = file_size / (1024 * 1024)
+                    error_entry.append(f"**文件大小**: {size_mb:.2f} MB")
+            except Exception:
+                pass
+            
+            error_entry.append("")
+            error_entry.append("### 错误详情")
+            error_entry.append("")
+            error_entry.append("```")
+            # 确保错误消息中的换行被正确处理
+            formatted_error = error_message.replace('\n', '\n')
+            error_entry.append(formatted_error)
+            error_entry.append("```")
+            error_entry.append("")
+            error_entry.append("")
+            
+            # 追加写入错误日志文件
+            try:
+                # 如果是新文件，添加标题和说明
+                is_new_file = not error_log_file.exists()
+                
+                with open(error_log_file, 'a', encoding='utf-8') as f:
+                    if is_new_file:
+                        # 新文件时添加标题和说明
+                        f.write("# MinerU 转换错误日志\n\n")
+                        f.write("> 本文档自动记录所有无法成功转换的文件信息\n\n")
+                        f.write("---\n\n")
+                    
+                    # 写入错误记录
+                    f.write("\n".join(error_entry))
+                    f.flush()  # 立即刷新，确保实时写入
+                
+                logger.info(f"错误日志已写入: {error_log_file}")
+            except Exception as e:
+                logger.error(f"写入错误日志文件失败: {e}")
+                
+        except Exception as e:
+            logger.error(f"记录错误日志时发生异常: {e}")
+    
     def process_single_task(self, task: ConversionTask):
         """处理单个任务"""
-        # 获取配置参数
-        output_dir = self.output_path_var.get()
-        backend = self.backend_var.get()
-
-        # 从显示名称中提取实际的方法代码
-        method_display = self.method_var.get()
-        if 'auto' in method_display:
-            method = 'auto'
-        elif 'txt' in method_display:
-            method = 'txt'
-        elif 'ocr' in method_display:
-            method = 'ocr'
-        else:
-            method = method_display
-
-        # 从显示名称中提取实际的语言代码
-        lang_display = self.lang_var.get()
-        lang = lang_display.split()[0] if ' ' in lang_display else lang_display  # 提取代码部分
-        formula_enable = self.formula_var.get()
-        table_enable = self.table_var.get()
-
-        # 页码范围
-        try:
-            start_page_id = int(self.start_page_var.get()) if self.start_page_var.get() else 0
-        except ValueError:
-            start_page_id = 0
-
-        try:
-            end_page_id = int(self.end_page_var.get()) if self.end_page_var.get() else None
-        except ValueError:
-            end_page_id = None
-
-        # 设备模式
-        device_mode = self.device_var.get().strip() or None
+        # 使用统一的配置提取方法
+        config = self._get_task_config()
+        
+        # 验证配置
+        is_valid, error_msg = self._validate_task_config(config)
+        if not is_valid:
+            raise ValueError(f"配置错误: {error_msg}")
+        
+        output_dir = config['output_dir']
+        backend = config['backend']
+        method = config['method']
+        lang = config['lang']
+        formula_enable = config['formula_enable']
+        table_enable = config['table_enable']
+        start_page_id = config['start_page_id']
+        end_page_id = config['end_page_id']
+        device_mode = config['device_mode']
+        
+        # 设置设备模式环境变量
         if device_mode:
             os.environ['MINERU_DEVICE_MODE'] = device_mode
 
@@ -2606,9 +3050,30 @@ class MinerUGUI(ctk.CTk):
 
         # 读取文件并确保资源管理
         pdf_bytes = None
+        
         try:
-            pdf_bytes = read_fn(task.file_path)
-            file_name = task.file_name
+            # 验证文件是否存在
+            if not task.file_path.exists():
+                raise FileNotFoundError(f"文件不存在: {task.file_path}")
+            
+            # 验证文件大小（防止处理过大的文件）
+            file_size = task.file_path.stat().st_size
+            max_file_size = 500 * 1024 * 1024  # 500MB
+            if file_size > max_file_size:
+                raise ValueError(f"文件过大 ({file_size / 1024 / 1024:.1f}MB)，超过限制 ({max_file_size / 1024 / 1024:.0f}MB)")
+            
+            # 读取文件
+            try:
+                pdf_bytes = read_fn(task.file_path)
+                file_name = task.file_name
+            except Exception as e:
+                error_handler = MinerUErrorHandler()
+                formatted_msg = error_handler.format_error_message(
+                    e, 
+                    context=f"读取文件: {task.file_path}"
+                )
+                logger.error(formatted_msg)
+                raise
 
             # 检查关闭事件
             if self._shutdown_event.is_set():
@@ -2618,36 +3083,121 @@ class MinerUGUI(ctk.CTk):
             task.progress = 0.2
             self.schedule_gui_update(self.update_queue_display)
 
-            # 执行转换
-            do_parse(
-                output_dir=output_dir,
-                pdf_file_names=[file_name],
-                pdf_bytes_list=[pdf_bytes],
-                p_lang_list=[lang],
-                backend=backend,
-                parse_method=method,
-                formula_enable=formula_enable,
-                table_enable=table_enable,
-                start_page_id=start_page_id,
-                end_page_id=end_page_id,
-            )
+            # 执行转换（支持重试）
+            conversion_success = False
+            last_error = None
+            
+            for attempt in range(task.max_retries + 1):  # 0, 1, 2, 3 (共4次尝试，首次+3次重试)
+                try:
+                    if attempt > 0:
+                        # 重试时等待一小段时间，并记录日志
+                        wait_time = min(attempt * 2, 10)  # 最多等待10秒
+                        self.log(f"   🔄 第 {attempt} 次重试（等待 {wait_time} 秒后开始）...", switch_to_log=True)
+                        time.sleep(wait_time)
+                        
+                        # 重新读取文件（确保资源是新鲜的）
+                        try:
+                            if pdf_bytes:
+                                try:
+                                    if hasattr(pdf_bytes, 'close'):
+                                        pdf_bytes.close()
+                                except Exception:
+                                    pass
+                            pdf_bytes = read_fn(task.file_path)
+                        except Exception as file_error:
+                            # 文件读取错误不应该重试，直接抛出
+                            error_handler = MinerUErrorHandler()
+                            formatted_msg = error_handler.format_error_message(
+                                file_error,
+                                context=f"重试时重新读取文件: {task.file_path}"
+                            )
+                            logger.error(formatted_msg)
+                            raise
+                    
+                    # 执行转换
+                    do_parse(
+                        output_dir=output_dir,
+                        pdf_file_names=[file_name],
+                        pdf_bytes_list=[pdf_bytes],
+                        p_lang_list=[lang],
+                        backend=backend,
+                        parse_method=method,
+                        formula_enable=formula_enable,
+                        table_enable=table_enable,
+                        start_page_id=start_page_id,
+                        end_page_id=end_page_id,
+                    )
+                    
+                    # 转换成功
+                    conversion_success = True
+                    task.retry_count = attempt
+                    if attempt > 0:
+                        self.log("   ✅ 重试成功！", switch_to_log=True)
+                    break
+                    
+                except (FileNotFoundError, ValueError, IOError, OSError) as e:
+                    # 文件相关错误不应该重试，直接抛出
+                    last_error = e
+                    task.retry_count = attempt
+                    raise
+                except Exception as e:
+                    last_error = e
+                    task.retry_count = attempt
+                    
+                    error_handler = MinerUErrorHandler()
+                    category, user_msg = error_handler.classify_exception(e)
+                    
+                    if attempt < task.max_retries:
+                        # 还可以重试
+                        self.log(f"   ⚠️ 转换失败（第 {attempt + 1} 次尝试）: {category.value}", switch_to_log=True)
+                        self.log(f"   错误详情: {user_msg[:100]}...", switch_to_log=True)
+                        
+                        # 判断是否可以重试
+                        if error_handler.should_retry(e):
+                            self.log("   💡 此错误可以重试，将自动重试...", switch_to_log=True)
+                        else:
+                            self.log("   ⚠️ 注意: 此错误类型通常不可重试，但仍将尝试重试", switch_to_log=True)
+                    else:
+                        # 已达到最大重试次数
+                        formatted_msg = error_handler.format_error_message(
+                            e,
+                            context=f"PDF转换过程: {file_name} (已重试 {task.max_retries} 次)"
+                        )
+                        logger.error(formatted_msg)
+                        self.log(f"   ❌ 转换失败（已重试 {task.max_retries} 次）: {category.value}", switch_to_log=True)
+                        self.log(f"   错误详情: {user_msg}", switch_to_log=True)
+            
+            # 如果所有重试都失败，抛出最后一个错误
+            if not conversion_success:
+                if last_error:
+                    raise last_error
+                else:
+                    raise RuntimeError(f"转换失败，原因未知（已重试 {task.max_retries} 次）")
 
             # 完成
             task.progress = 1.0
             self.schedule_gui_update(self.update_queue_display)
 
+        except (FileNotFoundError, ValueError, IOError, OSError):
+            # 文件相关错误，直接重新抛出让上层处理
+            raise
         except Exception as e:
-            # 重新抛出异常，让上层处理
-            raise e
+            # 其他错误，包装后重新抛出
+            error_handler = MinerUErrorHandler()
+            formatted_msg = error_handler.format_error_message(
+                e,
+                context=f"处理任务: {task.file_name}"
+            )
+            logger.error(formatted_msg)
+            raise
         finally:
             # 清理资源
             if pdf_bytes:
-                # 如果pdf_bytes有close方法，调用它
                 try:
                     if hasattr(pdf_bytes, 'close'):
                         pdf_bytes.close()
-                except Exception:
-                    pass
+                except Exception as cleanup_error:
+                    logger.warning(f"清理PDF资源时出错: {cleanup_error}")
     
     def cancel_conversion(self):
         """取消转换"""

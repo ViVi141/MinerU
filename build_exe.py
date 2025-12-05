@@ -9,20 +9,116 @@ import subprocess
 from pathlib import Path
 
 # 修复Windows控制台编码问题
+import os
 if sys.platform == 'win32':
     # 设置标准输出为UTF-8编码
     if hasattr(sys.stdout, 'reconfigure'):
         sys.stdout.reconfigure(encoding='utf-8')
     if hasattr(sys.stderr, 'reconfigure'):
         sys.stderr.reconfigure(encoding='utf-8')
-    # 或者使用环境变量
-    import os
+    # 使用环境变量设置编码
     os.environ['PYTHONIOENCODING'] = 'utf-8'
+
+def calculate_dir_size(path: Path) -> tuple[int, int]:
+    """计算目录的总大小和文件数量
+    
+    Args:
+        path: 目录路径
+        
+    Returns:
+        (总大小字节数, 文件数量)
+    """
+    total_size = 0
+    file_count = 0
+    if path.exists():
+        for file in path.rglob('*'):
+            if file.is_file():
+                try:
+                    total_size += file.stat().st_size
+                    file_count += 1
+                except (OSError, PermissionError):
+                    pass
+    return total_size, file_count
+
+
+def format_size(size_bytes: int) -> str:
+    """格式化文件大小为可读字符串
+    
+    Args:
+        size_bytes: 字节数
+        
+    Returns:
+        格式化后的字符串（如 "1.23 MB" 或 "2.45 GB"）
+    """
+    for unit, suffix in [(1024**3, 'GB'), (1024**2, 'MB'), (1024, 'KB')]:
+        if size_bytes >= unit:
+            return f"{size_bytes / unit:.2f} {suffix}"
+    return f"{size_bytes} B"
+
+
+def safe_add_data_file(datas: list, source_path: str | Path, target_path: str, 
+                       description: str = "") -> bool:
+    """安全地添加数据文件到列表
+    
+    Args:
+        datas: 数据文件列表
+        source_path: 源文件或目录路径
+        target_path: 目标路径（打包后的路径）
+        description: 描述信息（用于日志）
+        
+    Returns:
+        是否成功添加
+    """
+    source = Path(source_path)
+    if not source.exists():
+        return False
+    
+    try:
+        datas.append((str(source), target_path))
+        if description:
+            print(f"[INFO] 已添加{description}: {source}")
+        return True
+    except Exception as e:
+        print(f"[WARN] 添加{description}时出错: {e}")
+        return False
+
+
+def safe_add_package_resources(datas: list, package_name: str, 
+                               resource_configs: list[dict]) -> int:
+    """安全地添加Python包的资源文件
+    
+    Args:
+        datas: 数据文件列表
+        package_name: 包名
+        resource_configs: 资源配置列表，每个配置包含：
+            - subpath: 包内的子路径
+            - target: 打包后的目标路径
+            - description: 描述信息
+            
+    Returns:
+        成功添加的资源数量
+    """
+    count = 0
+    try:
+        package = __import__(package_name)
+        package_dir = Path(package.__file__).parent
+        
+        for config in resource_configs:
+            resource_path = package_dir / config['subpath']
+            if resource_path.exists():
+                if safe_add_data_file(datas, resource_path, config['target'], 
+                                     config.get('description', f"{package_name}资源")):
+                    count += 1
+    except ImportError:
+        print(f"[WARN] 无法导入{package_name}，跳过相关资源")
+    except Exception as e:
+        print(f"[WARN] 添加{package_name}资源时出错: {e}")
+    
+    return count
+
 
 def check_virtual_env():
     """检查是否在虚拟环境中运行"""
-    import sys
-
     # 检查是否在虚拟环境中
     in_venv = hasattr(sys, 'real_prefix') or (hasattr(sys, 'base_prefix') and sys.base_prefix != sys.prefix)
 
@@ -77,7 +173,6 @@ def check_pytorch_cuda():
     """
     try:
         import torch
-        import os
         
         # 检查PyTorch是否包含CUDA库（不检查是否有实际GPU）
         # 关键：检查torch.version.cuda是否存在，这表示PyTorch包含CUDA支持
@@ -172,13 +267,15 @@ def verify_necessary_files(project_dir: Path):
         for item in items:
             if item.exists():
                 if item.is_file():
-                    size = item.stat().st_size / (1024 * 1024)  # MB
-                    print(f"  [OK] {item.name} ({size:.2f} MB)")
+                    try:
+                        size = item.stat().st_size / (1024 * 1024)  # MB
+                        print(f"  [OK] {item.name} ({size:.2f} MB)")
+                    except (OSError, PermissionError):
+                        print(f"  [WARN] {item.name} (无法读取文件大小)")
                 else:
                     # 计算目录大小
-                    total_size = sum(f.stat().st_size for f in item.rglob('*') if f.is_file())
+                    total_size, file_count = calculate_dir_size(item)
                     size_mb = total_size / (1024 * 1024)
-                    file_count = sum(1 for _ in item.rglob('*') if _.is_file())
                     print(f"  [OK] {item.name}/ ({size_mb:.2f} MB, {file_count} 个文件)")
             else:
                 print(f"  [ERROR] {item} (缺失)")
@@ -218,16 +315,12 @@ def create_spec_file():
     datas = []
     
     # 配置文件
-    if (project_dir / 'mineru.json').exists():
-        datas.append((str(project_dir / 'mineru.json'), '.'))
-    if (project_dir / 'mineru.template.json').exists():
-        datas.append((str(project_dir / 'mineru.template.json'), '.'))
+    safe_add_data_file(datas, project_dir / 'mineru.json', '.', "配置文件")
+    safe_add_data_file(datas, project_dir / 'mineru.template.json', '.', "配置模板文件")
     
     # 模型文件 - Pipeline
     pipeline_dir = project_dir / 'models' / 'pipeline'
-    if pipeline_dir.exists():
-        datas.append((str(pipeline_dir), 'models/pipeline'))
-        print(f"[INFO] 已添加Pipeline模型目录: {pipeline_dir}")
+    safe_add_data_file(datas, pipeline_dir, 'models/pipeline', "Pipeline模型目录")
     
     # 模型文件 - VLM（排除以减小体积，仅支持Pipeline后端）
     # vlm_dir = project_dir / 'models' / 'vlm'
@@ -237,103 +330,47 @@ def create_spec_file():
     # MinerU资源文件（必需）
     mineru_resources_dir = project_dir / 'mineru' / 'resources'
     if mineru_resources_dir.exists():
-        # 包含fasttext-langdetect语言检测模型
         fasttext_dir = mineru_resources_dir / 'fasttext-langdetect'
-        if fasttext_dir.exists():
-            datas.append((str(fasttext_dir), 'mineru/resources/fasttext-langdetect'))
-            print(f"[INFO] 已添加fasttext语言检测模型: {fasttext_dir}")
+        safe_add_data_file(datas, fasttext_dir, 'mineru/resources/fasttext-langdetect', 
+                          "fasttext语言检测模型")
         
-        # header.html（Gradio使用，GUI不需要，但包含也无妨）
         header_file = mineru_resources_dir / 'header.html'
-        if header_file.exists():
-            datas.append((str(header_file), 'mineru/resources'))
-            print(f"[INFO] 已添加header.html: {header_file}")
+        safe_add_data_file(datas, header_file, 'mineru/resources', "header.html")
     
     # MinerU模型工具资源（OCR配置和字典）
     mineru_model_utils_resources = project_dir / 'mineru' / 'model' / 'utils' / 'pytorchocr' / 'utils' / 'resources'
-    if mineru_model_utils_resources.exists():
-        datas.append((str(mineru_model_utils_resources), 'mineru/model/utils/pytorchocr/utils/resources'))
-        print(f"[INFO] 已添加OCR资源目录: {mineru_model_utils_resources}")
+    safe_add_data_file(datas, mineru_model_utils_resources, 
+                      'mineru/model/utils/pytorchocr/utils/resources', "OCR资源目录")
     
     # SSL证书文件（certifi，必需，用于HTTPS连接）
     try:
         import certifi
-        import os
-        certifi_dir = os.path.dirname(certifi.__file__)
-        # certifi的证书文件
-        cert_file = os.path.join(certifi_dir, 'cacert.pem')
-        if os.path.exists(cert_file):
-            datas.append((cert_file, 'certifi'))
-            print(f"[INFO] 已添加SSL证书文件: {cert_file}")
-        else:
+        certifi_dir = Path(certifi.__file__).parent
+        cert_file = certifi_dir / 'cacert.pem'
+        if not safe_add_data_file(datas, cert_file, 'certifi', "SSL证书文件"):
             # 如果cacert.pem不存在，尝试包含整个certifi目录
-            datas.append((certifi_dir, 'certifi'))
-            print(f"[INFO] 已添加certifi目录: {certifi_dir}")
+            safe_add_data_file(datas, certifi_dir, 'certifi', "certifi目录")
     except ImportError:
         print("[WARN] 无法导入certifi，SSL证书可能缺失，HTTPS连接可能失败")
-    except Exception as e:
-        print(f"[WARN] 添加certifi证书文件时出错: {e}")
     
     # magika模型和配置文件（需要完整目录结构）
-    try:
-        import magika
-        import os
-        magika_dir = os.path.dirname(magika.__file__)
-        
-        # 打包models目录
-        magika_models_dir = os.path.join(magika_dir, 'models')
-        if os.path.exists(magika_models_dir):
-            datas.append((magika_models_dir, 'magika/models'))
-            print(f"[INFO] 已添加magika模型目录: {magika_models_dir}")
-        
-        # 打包config目录（包含content_types_kb.min.json等配置文件）
-        magika_config_dir = os.path.join(magika_dir, 'config')
-        if os.path.exists(magika_config_dir):
-            datas.append((magika_config_dir, 'magika/config'))
-            print(f"[INFO] 已添加magika配置目录: {magika_config_dir}")
-    except ImportError:
-        print("[WARN] 无法导入magika，跳过magika文件")
-    except Exception as e:
-        print(f"[WARN] 添加magika文件时出错: {e}")
+    safe_add_package_resources(datas, 'magika', [
+        {'subpath': 'models', 'target': 'magika/models', 'description': 'magika模型目录'},
+        {'subpath': 'config', 'target': 'magika/config', 'description': 'magika配置目录'},
+    ])
 
     # fast_langdetect模型和资源文件（需要resources目录）
-    try:
-        import fast_langdetect
-        import os
-        fast_langdetect_dir = os.path.dirname(fast_langdetect.__file__)
-
-        # 添加ft_detect/resources目录（包含lid.176.ftz等模型文件）
-        ft_detect_resources_dir = os.path.join(fast_langdetect_dir, 'ft_detect', 'resources')
-        if os.path.exists(ft_detect_resources_dir):
-            datas.append((ft_detect_resources_dir, 'fast_langdetect/ft_detect/resources'))
-            print(f"[INFO] 已添加fast_langdetect资源目录: {ft_detect_resources_dir}")
-    except ImportError:
-        print("[WARN] 无法导入fast_langdetect，跳过fast_langdetect文件")
-    except Exception as e:
-        print(f"[WARN] 添加fast_langdetect文件时出错: {e}")
+    safe_add_package_resources(datas, 'fast_langdetect', [
+        {'subpath': 'ft_detect/resources', 'target': 'fast_langdetect/ft_detect/resources', 
+         'description': 'fast_langdetect资源目录'},
+    ])
 
     # doclayout_yolo配置和数据文件（需要完整目录结构）
-    try:
-        import doclayout_yolo
-        import os
-        doclayout_yolo_dir = os.path.dirname(doclayout_yolo.__file__)
-        
-        # 打包cfg目录（包含default.yaml等配置文件）
-        doclayout_yolo_cfg_dir = os.path.join(doclayout_yolo_dir, 'cfg')
-        if os.path.exists(doclayout_yolo_cfg_dir):
-            datas.append((doclayout_yolo_cfg_dir, 'doclayout_yolo/cfg'))
-            print(f"[INFO] 已添加doclayout_yolo配置目录: {doclayout_yolo_cfg_dir}")
-        
-        # 打包其他可能的数据文件目录（如果存在）
-        for subdir in ['data', 'utils']:
-            subdir_path = os.path.join(doclayout_yolo_dir, subdir)
-            if os.path.exists(subdir_path):
-                datas.append((subdir_path, f'doclayout_yolo/{subdir}'))
-                print(f"[INFO] 已添加doclayout_yolo {subdir} 目录: {subdir_path}")
-    except ImportError:
-        print("[WARN] 无法导入doclayout_yolo，跳过doclayout_yolo文件")
-    except Exception as e:
-        print(f"[WARN] 添加doclayout_yolo文件时出错: {e}")
+    safe_add_package_resources(datas, 'doclayout_yolo', [
+        {'subpath': 'cfg', 'target': 'doclayout_yolo/cfg', 'description': 'doclayout_yolo配置目录'},
+        {'subpath': 'data', 'target': 'doclayout_yolo/data', 'description': 'doclayout_yolo data 目录'},
+        {'subpath': 'utils', 'target': 'doclayout_yolo/utils', 'description': 'doclayout_yolo utils 目录'},
+    ])
     
     # 将数据文件列表转换为字符串（处理Windows路径）
     def format_path(path):
@@ -563,23 +600,21 @@ excludes = [
 binaries = []
 try:
     import torch
-    import os
-    # PyTorch的CUDA库通常在这些位置
-    torch_lib_path = os.path.dirname(torch.__file__)
-    cuda_lib_path = os.path.join(torch_lib_path, 'lib')
+    torch_lib_path = Path(torch.__file__).parent
+    cuda_lib_path = torch_lib_path / 'lib'
     
-    if os.path.exists(cuda_lib_path):
+    if cuda_lib_path.exists():
         # 收集所有CUDA相关的DLL文件（Windows）
-        for file in os.listdir(cuda_lib_path):
-            if file.endswith('.dll') and ('cuda' in file.lower() or 'cudnn' in file.lower()):
-                src_path = os.path.join(cuda_lib_path, file)
-                # PyInstaller会自动处理这些文件，但我们可以显式添加以确保包含
-                binaries.append((src_path, 'torch/lib'))
-                print(f"[INFO] 已添加 CUDA 库文件: {file}")
+        for file in cuda_lib_path.iterdir():
+            if file.is_file() and file.suffix == '.dll':
+                filename_lower = file.name.lower()
+                if 'cuda' in filename_lower or 'cudnn' in filename_lower:
+                    # PyInstaller会自动处理这些文件，但我们可以显式添加以确保包含
+                    binaries.append((str(file), 'torch/lib'))
+                    print(f"[INFO] 已添加 CUDA 库文件: {file.name}")
 except Exception as e:
     # 如果收集失败，PyInstaller会自动处理，不影响打包
     print(f"[INFO] CUDA 库文件将由 PyInstaller 自动收集: {e}")
-    pass
 
 a = Analysis(
     ['mineru_gui.py'],
@@ -646,47 +681,59 @@ def update_mineru_json_for_bundle():
     config_file = project_dir / "mineru.json"
     
     if not config_file.exists():
-        print("[WARN] 配置文件不存在: " + str(config_file))
+        print(f"[WARN] 配置文件不存在: {config_file}")
         return None
     
     import json
-    with open(config_file, 'r', encoding='utf-8') as f:
-        config = json.load(f)
     
-    # 更新模型路径为相对路径（打包后会在_MEIPASS/models/pipeline下）
-    # 仅包含Pipeline模型，排除VLM以减小体积
-    if 'models-dir' not in config:
-        config['models-dir'] = {}
-    
-    # 打包后的模型路径在_MEIPASS/models/pipeline下
-    # 但MinerU会从配置文件读取，所以需要设置为相对路径
-    # 实际运行时，程序会从_MEIPASS/models/pipeline读取
-    config['models-dir']['pipeline'] = './models/pipeline'
-    
-    # 不包含VLM模型路径，因为已排除VLM后端
-    if 'vlm' in config['models-dir']:
-        del config['models-dir']['vlm']
-    
-    # 保存备份
-    backup_file = config_file.with_suffix('.json.backup')
-    shutil.copy(config_file, backup_file)
-    print(f"[OK] 已备份原配置文件: {backup_file}")
-    
-    # 保存更新后的配置
-    with open(config_file, 'w', encoding='utf-8') as f:
-        json.dump(config, f, ensure_ascii=False, indent=4)
-    
-    print("[OK] 已更新配置文件以支持打包")
-    print(f"     模型路径已设置为: {config['models-dir']['pipeline']}")
-    return backup_file
+    try:
+        # 读取配置
+        with open(config_file, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+        
+        # 保存备份
+        backup_file = config_file.with_suffix('.json.backup')
+        shutil.copy(config_file, backup_file)
+        print(f"[OK] 已备份原配置文件: {backup_file}")
+        
+        # 更新模型路径为相对路径（打包后会在_MEIPASS/models/pipeline下）
+        # 仅包含Pipeline模型，排除VLM以减小体积
+        if 'models-dir' not in config:
+            config['models-dir'] = {}
+        
+        # 打包后的模型路径在_MEIPASS/models/pipeline下
+        # 但MinerU会从配置文件读取，所以需要设置为相对路径
+        # 实际运行时，程序会从_MEIPASS/models/pipeline读取
+        config['models-dir']['pipeline'] = './models/pipeline'
+        
+        # 不包含VLM模型路径，因为已排除VLM后端
+        if 'vlm' in config['models-dir']:
+            del config['models-dir']['vlm']
+        
+        # 保存更新后的配置
+        with open(config_file, 'w', encoding='utf-8') as f:
+            json.dump(config, f, ensure_ascii=False, indent=4)
+        
+        print("[OK] 已更新配置文件以支持打包")
+        print(f"     模型路径已设置为: {config['models-dir']['pipeline']}")
+        return backup_file
+    except (IOError, json.JSONDecodeError) as e:
+        print(f"[ERROR] 读取或更新配置文件失败: {e}")
+        return None
 
-def restore_mineru_json(backup_file):
+def restore_mineru_json(backup_file: Path | None):
     """恢复原始配置文件"""
-    if backup_file and backup_file.exists():
+    if not backup_file or not backup_file.exists():
+        return
+    
+    try:
         config_file = backup_file.with_suffix('').with_suffix('.json')
         shutil.copy(backup_file, config_file)
         backup_file.unlink()
         print("[OK] 已恢复原始配置文件")
+    except (IOError, OSError) as e:
+        print(f"[WARN] 恢复配置文件失败: {e}")
+        print(f"      请手动从备份文件恢复: {backup_file}")
 
 def analyze_package_size():
     """分析打包体积，显示优化建议"""
@@ -697,17 +744,20 @@ def analyze_package_size():
     # 分析模型文件大小
     pipeline_dir = Path("models/pipeline")
     if pipeline_dir.exists():
-        total_size = sum(f.stat().st_size for f in pipeline_dir.rglob('*') if f.is_file())
+        total_size, _ = calculate_dir_size(pipeline_dir)
         size_gb = total_size / (1024**3)
         print(f"📁 Pipeline模型目录: {size_gb:.2f} GB")
 
         # 分析子目录
-        for subdir in pipeline_dir.rglob('*'):
-            if subdir.is_dir():
-                sub_size = sum(f.stat().st_size for f in subdir.rglob('*') if f.is_file())
-                if sub_size > 0:
-                    sub_size_mb = sub_size / (1024**2)
-                    print(f"  └─ {subdir.name}: {sub_size_mb:.1f} MB")
+        try:
+            for subdir in sorted(pipeline_dir.iterdir()):
+                if subdir.is_dir():
+                    sub_size, _ = calculate_dir_size(subdir)
+                    if sub_size > 0:
+                        sub_size_mb = sub_size / (1024**2)
+                        print(f"  └─ {subdir.name}: {sub_size_mb:.1f} MB")
+        except (OSError, PermissionError):
+            pass
 
     # 分析其他大文件
     other_dirs = [
@@ -718,7 +768,7 @@ def analyze_package_size():
     for dir_path, desc in other_dirs:
         path = Path(dir_path)
         if path.exists():
-            total_size = sum(f.stat().st_size for f in path.rglob('*') if f.is_file())
+            total_size, _ = calculate_dir_size(path)
             size_gb = total_size / (1024**3)
             if size_gb > 0.1:  # 只显示大于100MB的目录
                 print(f"📁 {desc}: {size_gb:.2f} GB")
@@ -802,12 +852,22 @@ def build_exe():
         # 清理之前的构建
         dist_dir = project_dir / "dist"
         build_dir = project_dir / "build"
-        if dist_dir.exists():
-            print("[INFO] 清理旧的 dist 目录...")
-            shutil.rmtree(dist_dir)
-        if build_dir.exists():
-            print("[INFO] 清理旧的 build 目录...")
-            shutil.rmtree(build_dir)
+        
+        def safe_remove_dir(dir_path: Path, name: str) -> bool:
+            """安全地删除目录"""
+            if dir_path.exists():
+                try:
+                    print(f"[INFO] 清理旧的 {name} 目录...")
+                    shutil.rmtree(dir_path)
+                    return True
+                except (OSError, PermissionError) as e:
+                    print(f"[WARN] 无法删除 {name} 目录: {e}")
+                    print("      可能会影响打包结果，建议手动删除后重试")
+                    return False
+            return True
+        
+        safe_remove_dir(dist_dir, "dist")
+        safe_remove_dir(build_dir, "build")
         
         # 执行打包
         print("\n" + "=" * 60)
@@ -827,7 +887,17 @@ def build_exe():
             str(spec_file)
         ]
         
-        result = subprocess.run(cmd, cwd=project_dir)
+        print(f"\n执行命令: {' '.join(cmd)}\n")
+        
+        try:
+            result = subprocess.run(cmd, cwd=project_dir, check=False, 
+                                  capture_output=False, text=True)
+        except KeyboardInterrupt:
+            print("\n\n[WARN] 打包过程被用户中断")
+            return False
+        except Exception as e:
+            print(f"\n[ERROR] 执行打包命令时出错: {e}")
+            return False
         
         if result.returncode == 0:
             print("\n" + "=" * 60)
@@ -839,9 +909,7 @@ def build_exe():
             
             if exe_dir.exists() and exe_path.exists():
                 # 计算目录总大小
-                total_size = sum(
-                    f.stat().st_size for f in exe_dir.rglob('*') if f.is_file()
-                )
+                total_size, file_count = calculate_dir_size(exe_dir)
                 size_mb = total_size / (1024*1024)
                 size_gb = total_size / (1024*1024*1024)
                 
@@ -852,8 +920,6 @@ def build_exe():
                 else:
                     print(f"目录总大小: {size_mb:.2f} MB")
                 
-                # 统计文件数量
-                file_count = sum(1 for _ in exe_dir.rglob('*') if _.is_file())
                 print(f"包含文件数: {file_count} 个")
                 
                 print("\n[OK] 目录模式打包完成，可以正常使用")
