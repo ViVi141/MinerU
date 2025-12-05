@@ -235,13 +235,20 @@ if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
                 config = {}
             
             # 确保models-dir配置存在并指向打包后的模型
+            config_changed = False
             if 'models-dir' not in config:
                 config['models-dir'] = {}
-            config['models-dir']['pipeline'] = str(models_pipeline_path.resolve())
+                config_changed = True
             
-            # 保存配置文件
-            with open(config_file, 'w', encoding='utf-8') as f:
-                json.dump(config, f, ensure_ascii=False, indent=4)
+            new_pipeline_path = str(models_pipeline_path.resolve())
+            if config['models-dir'].get('pipeline') != new_pipeline_path:
+                config['models-dir']['pipeline'] = new_pipeline_path
+                config_changed = True
+            
+            # 只在配置真正改变时才保存文件（优化启动速度）
+            if config_changed:
+                with open(config_file, 'w', encoding='utf-8') as f:
+                    json.dump(config, f, ensure_ascii=False, indent=4)
             
             os.environ['MINERU_TOOLS_CONFIG_JSON'] = str(config_file.resolve())
         except Exception:
@@ -259,9 +266,9 @@ else:
     if models_dir.exists():
         os.environ['MINERU_MODEL_SOURCE'] = 'local'
 
-# 现在才导入 mineru 模块
-from mineru.cli.common import do_parse, read_fn  # noqa: E402
-import pypdfium2 as pdfium  # noqa: E402
+# 延迟导入 mineru 模块（只在真正需要时才导入，加快GUI启动速度）
+# from mineru.cli.common import do_parse, read_fn  # 延迟导入
+# import pypdfium2 as pdfium  # 延迟导入
 
 # 设置CustomTkinter主题 - 跟随系统主题
 ctk.set_appearance_mode("system")  # "system" 跟随系统主题, "light" 或 "dark" 固定主题
@@ -413,6 +420,40 @@ class ConversionTask:
 
 class MinerUGUI(ctk.CTk):
     """MinerU GUI主窗口 - 支持任务队列版本"""
+    
+    # 延迟导入的模块缓存
+    _mineru_imported = False
+    _pdfium_imported = False
+    _do_parse = None
+    _read_fn = None
+    _pdfium = None
+    
+    @classmethod
+    def _lazy_import_mineru(cls):
+        """延迟导入 mineru 模块（只在首次调用时导入）"""
+        if not cls._mineru_imported:
+            try:
+                from mineru.cli.common import do_parse, read_fn
+                cls._do_parse = do_parse
+                cls._read_fn = read_fn
+                cls._mineru_imported = True
+                logger.debug("MinerU 模块已延迟加载")
+            except Exception as e:
+                logger.error(f"延迟加载 MinerU 模块失败: {e}")
+                raise
+    
+    @classmethod
+    def _lazy_import_pdfium(cls):
+        """延迟导入 pypdfium2 模块（只在首次调用时导入）"""
+        if not cls._pdfium_imported:
+            try:
+                import pypdfium2 as pdfium
+                cls._pdfium = pdfium
+                cls._pdfium_imported = True
+                logger.debug("pypdfium2 模块已延迟加载")
+            except Exception as e:
+                logger.error(f"延迟加载 pypdfium2 模块失败: {e}")
+                raise
     
     def __init__(self):
         super().__init__()
@@ -2739,11 +2780,13 @@ class MinerUGUI(ctk.CTk):
 
                 # 处理任务
                 try:
-                    # 获取PDF页数
+                    # 获取PDF页数（延迟导入）
                     pdf_doc = None
                     try:
-                        pdf_bytes = read_fn(task.file_path)
-                        pdf_doc = pdfium.PdfDocument(pdf_bytes)
+                        self._lazy_import_mineru()
+                        self._lazy_import_pdfium()
+                        pdf_bytes = self._read_fn(task.file_path)
+                        pdf_doc = self._pdfium.PdfDocument(pdf_bytes)
                         task.page_count = len(pdf_doc)
                     except Exception:
                         task.page_count = 0
@@ -3062,9 +3105,12 @@ class MinerUGUI(ctk.CTk):
             if file_size > max_file_size:
                 raise ValueError(f"文件过大 ({file_size / 1024 / 1024:.1f}MB)，超过限制 ({max_file_size / 1024 / 1024:.0f}MB)")
             
+            # 延迟导入 read_fn（首次使用时才导入）
+            self._lazy_import_mineru()
+            
             # 读取文件
             try:
-                pdf_bytes = read_fn(task.file_path)
+                pdf_bytes = self._read_fn(task.file_path)
                 file_name = task.file_name
             except Exception as e:
                 error_handler = MinerUErrorHandler()
@@ -3103,7 +3149,7 @@ class MinerUGUI(ctk.CTk):
                                         pdf_bytes.close()
                                 except Exception:
                                     pass
-                            pdf_bytes = read_fn(task.file_path)
+                            pdf_bytes = self._read_fn(task.file_path)
                         except Exception as file_error:
                             # 文件读取错误不应该重试，直接抛出
                             error_handler = MinerUErrorHandler()
@@ -3114,8 +3160,8 @@ class MinerUGUI(ctk.CTk):
                             logger.error(formatted_msg)
                             raise
                     
-                    # 执行转换
-                    do_parse(
+                    # 执行转换（延迟导入已在前面的 read_fn 调用时完成）
+                    self._do_parse(
                         output_dir=output_dir,
                         pdf_file_names=[file_name],
                         pdf_bytes_list=[pdf_bytes],
